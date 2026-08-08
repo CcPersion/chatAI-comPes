@@ -1,37 +1,67 @@
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a2e; }
-  video { width: 100%; height: 100%; object-fit: contain; object-position: right center; display: none; background: #0a0a14; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #080d1a; }
+  body::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: 2;
+    pointer-events: none;
+    background:
+      linear-gradient(90deg, rgba(8,13,26,.34), transparent 30%),
+      linear-gradient(0deg, rgba(8,13,26,.20), transparent 28%);
+  }
+  video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    object-position: center center;
+    display: none;
+    opacity: 0;
+    background: transparent;
+    transition: opacity 320ms cubic-bezier(.16,1,.3,1);
+  }
   #placeholder {
-    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
-    display: flex; align-items: center; justify-content: center;
-    color: #ffffffaa; font-family: sans-serif; text-align: center;
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #cbd5e1;
+    font-family: 'Noto Sans SC', 'Microsoft YaHei UI', sans-serif;
+    text-align: center;
     pointer-events: none;
   }
   #placeholder .icon {
-    width: 64px; height: 64px; margin: 0 auto 16px;
+    width: 64px;
+    height: 64px;
+    margin: 0 auto 16px;
     border-radius: 50%;
     background: radial-gradient(circle at 35% 30%, #a78bfa, #312e81 58%, #0f172a 100%);
-    box-shadow: 0 0 40px rgba(124, 58, 237, .3);
+    box-shadow: 0 0 40px rgba(124,58,237,.3);
   }
-  #placeholder .title { font-size: 18px; }
-  #placeholder .sub { font-size: 14px; color: #666; margin-top: 4px; }
+  #placeholder .title { font-size: 16px; }
+  #placeholder .sub { margin-top: 5px; color: #7f8aa3; font-size: 12px; }
+  @media (prefers-reduced-motion: reduce) {
+    video { transition: none; }
+  }
 </style>
 </head>
 <body>
-<div id="placeholder">
+<div id="placeholder" role="status" aria-live="polite">
   <div>
-    <div class="icon">🫀</div>
+    <div class="icon" aria-hidden="true"></div>
     <div class="title">数字人待机中...</div>
     <div class="sub" id="status-text">正在连接...</div>
   </div>
 </div>
-<video id="video" autoplay playsinline muted></video>
+<video id="video" autoplay playsinline muted aria-label="数字人实时画面"></video>
 
 <script>
 var pc = null;
@@ -39,24 +69,24 @@ var videoEl = document.getElementById('video');
 var placeholder = document.getElementById('placeholder');
 var statusText = document.getElementById('status-text');
 
-function connect() {
-  var config = { sdpSemantics: 'unified-plan' };
-  pc = new RTCPeerConnection(config);
+function revealVideo() {
+  placeholder.style.display = 'none';
+  videoEl.style.display = 'block';
+  requestAnimationFrame(function() { videoEl.style.opacity = '1'; });
+}
 
+function connect() {
+  pc = new RTCPeerConnection({ sdpSemantics: 'unified-plan' });
   pc.addTransceiver('video', { direction: 'recvonly' });
   pc.addTransceiver('audio', { direction: 'recvonly' });
 
   pc.addEventListener('track', function(evt) {
     if (evt.track.kind === 'video') {
-      // 建纯视频 stream，隔离 WebRTC 音频轨道（音频由外部 Gradio 播放）
-      var videoStream = new MediaStream([evt.track]);
-      videoEl.srcObject = videoStream;
-      videoEl.onloadedmetadata = function() {
-        placeholder.style.display = 'none';
-        videoEl.style.display = 'block';
-      };
+      videoEl.srcObject = new MediaStream([evt.track]);
+      videoEl.onloadeddata = revealVideo;
+      videoEl.onplaying = revealVideo;
+      videoEl.play().catch(function() {});
     }
-    // 忽略 audio track — 不连接到任何元素
   });
 
   pc.addEventListener('iceconnectionstatechange', function() {
@@ -66,30 +96,36 @@ function connect() {
     }
   });
 
-  pc.createOffer().then(function(offer) {
-    return pc.setLocalDescription(offer);
-  }).then(function() {
-    return new Promise(function(resolve) {
-      if (pc.iceGatheringState === 'complete') resolve();
-      else pc.addEventListener('icegatheringstatechange', function check() {
-        if (pc.iceGatheringState === 'complete') {
-          pc.removeEventListener('icegatheringstatechange', check);
-          resolve();
-        }
+  pc.createOffer()
+    .then(function(offer) { return pc.setLocalDescription(offer); })
+    .then(function() {
+      return new Promise(function(resolve) {
+        if (pc.iceGatheringState === 'complete') return resolve();
+        pc.addEventListener('icegatheringstatechange', function check() {
+          if (pc.iceGatheringState === 'complete') {
+            pc.removeEventListener('icegatheringstatechange', check);
+            resolve();
+          }
+        });
       });
+    })
+    .then(function() {
+      return fetch('/offer', {
+        body: JSON.stringify({
+          sdp: pc.localDescription.sdp,
+          type: pc.localDescription.type,
+          sessionid: '0'
+        }),
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST'
+      });
+    })
+    .then(function(resp) { return resp.json(); })
+    .then(function(answer) { return pc.setRemoteDescription(answer); })
+    .catch(function(error) {
+      statusText.textContent = '连接失败，请确认 LiveTalking 已启动';
+      console.error('WebRTC error:', error);
     });
-  }).then(function() {
-    return fetch('/offer', {
-      body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type, sessionid: '0' }),
-      headers: { 'Content-Type': 'application/json' },
-      method: 'POST'
-    });
-  }).then(function(resp) { return resp.json(); })
-  .then(function(answer) { return pc.setRemoteDescription(answer); })
-  .catch(function(e) {
-    statusText.textContent = '连接失败，请确认 LiveTalking 已启动';
-    console.error('WebRTC error:', e);
-  });
 }
 
 connect();

@@ -1092,41 +1092,57 @@ def create_ui():
        Motion: 200-300ms ease-out
        ═══════════════════════════════════════════════════════════════════════════ */
 
-    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600&display=swap');
-
     /* ── Base ──────────────────────────────────────────────────────────────── */
     footer { display: none !important; }
     .gradio-container {
         max-width: 100% !important;
         padding: 0 !important;
-        font-family: 'Poppins', system-ui, -apple-system, sans-serif !important;
+        font-family: 'Noto Sans SC', 'Microsoft YaHei UI', system-ui, -apple-system, sans-serif !important;
+        overflow: hidden !important;
     }
     body, .gradio-container {
-        background: #0B1120 !important;
+        background:
+            radial-gradient(circle at 68% 48%, rgba(91,54,160,0.14), transparent 32%),
+            linear-gradient(120deg, #080D1A 0%, #0B1120 54%, #080B14 100%) !important;
         color: #E2E8F0 !important;
     }
 
     /* ── Ambient background glow ───────────────────────────────────────────── */
     .main-layout::before {
         content: '' !important;
-        position: fixed !important;
-        top: 50% !important; left: 50% !important;
-        width: 600px !important; height: 600px !important;
-        transform: translate(-50%, -50%) !important;
-        background: radial-gradient(circle, rgba(124,58,237,0.06) 0%, transparent 70%) !important;
+        position: absolute !important;
+        inset: 0 !important;
+        background:
+            radial-gradient(circle at 31% 72%, rgba(124,58,237,0.10) 0%, transparent 28%),
+            radial-gradient(circle at 72% 35%, rgba(236,72,153,0.05) 0%, transparent 26%) !important;
         pointer-events: none !important;
-        z-index: 0 !important;
+        z-index: 2 !important;
+    }
+    .main-layout::after {
+        content: '' !important;
+        position: absolute !important;
+        inset: 0 !important;
+        background: linear-gradient(90deg,
+            rgba(8,13,26,0.34) 0%,
+            rgba(8,13,26,0.18) 42%,
+            rgba(8,13,26,0.70) 54%,
+            rgba(8,13,26,0.26) 67%,
+            transparent 82%) !important;
+        pointer-events: none !important;
+        z-index: 2 !important;
     }
 
     /* ── Two-Zone Layout: 2/3 UI + 1/3 Avatar, seamless dark canvas ──── */
     .main-layout {
-        display: grid !important;
-        grid-template-columns: 2fr 1fr !important;
+        display: block !important;
         width: 100% !important;
         height: 100vh !important;
         max-width: 100% !important;
         margin: 0 !important;
         gap: 0 !important;
+        position: relative !important;
+        overflow: hidden !important;
+        background: transparent !important;
     }
     .main-layout > div {
         display: flex !important;
@@ -1139,10 +1155,20 @@ def create_ui():
     .left-zone {
         display: flex !important;
         flex-direction: column !important;
-        padding: 28px 24px 24px 32px !important;
+        padding: 32px 72px 24px 40px !important;
         background: transparent !important;
         border: none !important;
         position: relative !important;
+        width: 62% !important;
+        height: 100vh !important;
+        z-index: 3 !important;
+    }
+    .left-zone::after {
+        display: none !important;
+    }
+    .left-zone > * {
+        position: relative !important;
+        z-index: 1 !important;
     }
 
     /* ── Right: avatar video ──────────────────────────────────────────── */
@@ -1151,8 +1177,18 @@ def create_ui():
         overflow: hidden !important;
         background: transparent !important;
         border: none !important;
+        position: absolute !important;
+        top: 0 !important;
+        right: 0 !important;
+        bottom: 0 !important;
+        left: auto !important;
+        margin: 0 !important;
+        width: 58vw !important;
+        height: 100vh !important;
+        z-index: 1 !important;
+        -webkit-mask-image: linear-gradient(90deg, transparent 0%, rgba(0,0,0,.55) 16%, #000 36%, #000 100%) !important;
+        mask-image: linear-gradient(90deg, transparent 0%, rgba(0,0,0,.55) 16%, #000 36%, #000 100%) !important;
     }
-    .right-zone,
     .right-zone > *,
     .right-zone > * > *,
     .right-zone > * > * > * {
@@ -1164,8 +1200,9 @@ def create_ui():
         height: 100% !important;
         border: none !important;
         display: block !important;
+        filter: saturate(0.92) contrast(1.02) brightness(0.90) !important;
     }
-    .avatar-shell { position: relative; width: 100%; height: 100%; min-height: 240px; background: #0B1120; }
+    .avatar-shell { position: relative; width: 100%; height: 100%; min-height: 240px; background: transparent; }
     .avatar-fallback { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: #94A3B8; font-size: 13px; text-align: center; }
     .avatar-fallback-mark { width: 72px; height: 72px; border-radius: 50%; background: radial-gradient(circle at 35% 30%, #A78BFA, #312E81 58%, #0F172A 100%); box-shadow: 0 0 48px rgba(124,58,237,.28); }
     .avatar-fallback-title { color: #CBD5E1; font-size: 16px; }
@@ -1176,48 +1213,83 @@ def create_ui():
         flex: 1 !important;
         min-height: 0 !important;
         overflow-y: auto !important;
-        margin-bottom: 16px !important;
-        border-radius: 12px !important;
-        background: rgba(15,23,42,0.5) !important;
-        padding: 16px !important;
+        margin: 0 0 8px !important;
+        border: none !important;
+        border-radius: 0 !important;
+        box-shadow: none !important;
+        background: transparent !important;
+        padding: 8px 4px 16px !important;
+    }
+    .chat-panel > div, .chat-panel .wrap, .chat-panel .panel {
+        border: none !important;
+        box-shadow: none !important;
+        background: transparent !important;
+    }
+    .chat-panel .placeholder-container {
+        border: none !important;
+        box-shadow: none !important;
+        background: transparent !important;
     }
     .chat-panel .message-wrap { color: #CBD5E1 !important; }
-    .chat-panel .bubble-wrap { border-radius: 12px !important; }
-    .chat-panel .user .bubble-wrap { background: rgba(30,41,59,0.6) !important; }
-    .chat-panel .bot .bubble-wrap { background: rgba(124,58,237,0.12) !important; }
+    .chat-panel .bubble-wrap {
+        border: none !important;
+        border-radius: 0 !important;
+        background: transparent !important;
+        box-shadow: none !important;
+    }
+    .chat-panel .flex-wrap.user {
+        background: rgba(51,65,85,0.72) !important;
+        border-radius: 12px !important;
+    }
+    .chat-panel .flex-wrap.bot {
+        background: rgba(124,58,237,0.14) !important;
+        border-radius: 12px !important;
+    }
     .input-row {
         flex-shrink: 0 !important;
-        gap: 8px !important;
+        gap: 6px !important;
+        padding: 6px !important;
+        border: none !important;
+        border-radius: 16px !important;
+        background: rgba(21,29,48,0.70) !important;
+        box-shadow: 0 16px 50px rgba(0,0,0,0.18), inset 0 1px 0 rgba(255,255,255,0.035) !important;
+        backdrop-filter: blur(18px) saturate(120%) !important;
+    }
+    .input-row > div, .input-row .form, .input-row .wrap {
+        border: none !important;
+        box-shadow: none !important;
+        background: transparent !important;
     }
     .input-row input, .input-row textarea {
-        background: rgba(30,41,59,0.5) !important;
-        border: 1px solid rgba(124,58,237,0.15) !important;
-        border-radius: 10px !important;
+        background: transparent !important;
+        border: none !important;
+        border-radius: 12px !important;
         color: #E2E8F0 !important;
         padding: 12px 16px !important;
-        font-size: 14px !important;
-        transition: border-color 200ms ease-out, box-shadow 200ms ease-out !important;
+        font-size: 15px !important;
+        transition: background 200ms ease-out, box-shadow 200ms ease-out !important;
     }
     .input-row input:focus, .input-row textarea:focus {
-        border-color: #7C3AED !important;
         outline: none !important;
-        box-shadow: 0 0 0 3px rgba(124,58,237,0.15) !important;
+        background: rgba(255,255,255,0.025) !important;
+        box-shadow: 0 0 0 2px rgba(139,92,246,0.35) !important;
     }
     .input-row button {
-        background: rgba(124,58,237,0.15) !important;
-        color: #A78BFA !important;
-        border: 1px solid rgba(124,58,237,0.3) !important;
-        border-radius: 10px !important;
-        padding: 10px 20px !important;
+        min-height: 44px !important;
+        background: linear-gradient(135deg, rgba(124,58,237,0.86), rgba(99,102,241,0.76)) !important;
+        color: #F5F3FF !important;
+        border: none !important;
+        border-radius: 12px !important;
+        padding: 10px 22px !important;
         font-weight: 500 !important;
         font-size: 14px !important;
         cursor: pointer !important;
         transition: all 200ms ease-out !important;
     }
     .input-row button:hover {
-        background: rgba(124,58,237,0.25) !important;
-        border-color: #7C3AED !important;
-        color: #C4B5FD !important;
+        background: linear-gradient(135deg, rgba(139,92,246,0.96), rgba(99,102,241,0.90)) !important;
+        color: #FFFFFF !important;
+        box-shadow: 0 8px 24px rgba(91,33,182,0.24) !important;
     }
     .input-row button:active { transform: scale(0.98) !important; }
 
@@ -1227,7 +1299,7 @@ def create_ui():
         align-items: center !important;
         justify-content: center !important;
         gap: 20px !important;
-        padding: 20px 0 !important;
+        padding: 14px 0 24px !important;
         flex-shrink: 0 !important;
         border: none !important;
         background: transparent !important;
@@ -1305,22 +1377,23 @@ def create_ui():
     /* ── Subtle floating audio bar, center bottom ────────────────────────── */
     .audio-player {
         position: fixed !important;
-        bottom: 24px !important;
-        left: 28% !important;
-        right: 38% !important;
-        width: auto !important;
-        z-index: 9999 !important;
-        background: rgba(15,23,42,0.85) !important;
-        border: 1px solid rgba(124,58,237,0.25) !important;
-        border-radius: 8px !important;
-        padding: 3px 8px !important;
-        backdrop-filter: blur(8px) !important;
+        left: 0 !important;
+        bottom: 0 !important;
+        width: 1px !important;
+        height: 1px !important;
+        min-width: 0 !important;
+        min-height: 0 !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        overflow: hidden !important;
+        opacity: 0 !important;
+        clip-path: inset(50%) !important;
+        pointer-events: none !important;
+        border: 0 !important;
+        background: transparent !important;
+        box-shadow: none !important;
+        z-index: -1 !important;
     }
-    .audio-player audio {
-        width: 100% !important;
-        height: 28px !important;
-    }
-    .audio-player .label-wrap, .audio-player .icon-buttons { display: none !important; }
 
     /* ── Status dots ───────────────────────────────────────────────────────── */
     .status-dot {
@@ -1331,8 +1404,18 @@ def create_ui():
     .status-dot.disconnected, .status-dot.error { background: #EF4444; }
     .status-dot.degraded, .status-dot.timeout { background: #F59E0B; }
     .status-line {
-        color: #64748B; font-size: 11px; text-align: center;
-        margin-top: 16px; line-height: 1.8; letter-spacing: 0.3px;
+        color: #7F8AA3 !important; font-size: 11px !important; text-align: center !important;
+        margin: 6px 0 0 !important; line-height: 1.55 !important; letter-spacing: 0.3px !important;
+        border: none !important; background: transparent !important; box-shadow: none !important;
+    }
+    .status-line > div, .status-line .wrap, .status-line textarea, .status-line input {
+        min-height: 18px !important;
+        height: auto !important;
+        padding: 0 !important;
+        border: none !important;
+        background: transparent !important;
+        box-shadow: none !important;
+        color: #7F8AA3 !important;
     }
 
     /* ── Custom scrollbar ──────────────────────────────────────────────────── */
@@ -1340,6 +1423,33 @@ def create_ui():
     .chat-panel::-webkit-scrollbar-track { background: transparent; }
     .chat-panel::-webkit-scrollbar-thumb { background: rgba(124,58,237,0.2); border-radius: 4px; }
     .chat-panel::-webkit-scrollbar-thumb:hover { background: rgba(124,58,237,0.35); }
+
+    @media (max-width: 900px) {
+        .main-layout {
+            display: block !important;
+            min-height: 100vh !important;
+        }
+        .right-zone {
+            position: absolute !important;
+            inset: 0 !important;
+            width: 100% !important;
+            height: 100% !important;
+            margin: 0 !important;
+            opacity: 0.42 !important;
+            -webkit-mask-image: linear-gradient(180deg, #000 0%, rgba(0,0,0,.55) 46%, transparent 82%) !important;
+            mask-image: linear-gradient(180deg, #000 0%, rgba(0,0,0,.55) 46%, transparent 82%) !important;
+        }
+        .left-zone {
+            min-height: 100vh !important;
+            width: 100% !important;
+            padding: 24px 18px 18px !important;
+        }
+        .main-layout::after {
+            background: linear-gradient(180deg, transparent 0%, rgba(8,13,26,.46) 46%, #080D1A 82%) !important;
+        }
+        .left-zone::after { display: none !important; }
+        .voice-ball-btn { width: 132px !important; height: 132px !important; }
+    }
 
     /* ── Accessibility ─────────────────────────────────────────────────────── */
     @media (prefers-reduced-motion: reduce) {
