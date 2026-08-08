@@ -1,0 +1,19 @@
+# Windows 精简依赖 — 文本聊天核心功能
+# 全量语音管线依赖见 outputs/backend/requirements.txt
+
+# UI
+gradio==4.44.1
+
+# LLM 客户端 (Ollama OpenAI 兼容 API)
+httpx==0.27.2
+sseclient-py==1.8.0
+
+# 配置
+pyyaml==6.0.2
+
+# 基础工具
+numpy==1.26.4
+requests==2.32.3
+python-multipart==0.0.12
+pillow==10.4.0
+psutil==6.0.0

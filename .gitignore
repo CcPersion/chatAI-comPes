@@ -1,0 +1,35 @@
+# Local secrets and runtime files
+.env
+.env.*
+!.env.example
+*.log
+logs/
+__pycache__/
+*.py[cod]
+
+# Local model/runtime data
+venv/
+.venv/
+node_modules/
+outputs/backend/logs/
+outputs/backend/*.wav
+
+# Unreal generated files
+unreal/**/Binaries/
+unreal/**/DerivedDataCache/
+unreal/**/Intermediate/
+unreal/**/Saved/
+unreal/**/Build/
+unreal/**/.vs/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local agent/editor metadata
+.agents/
+.claude/
+.codex/
+=2.0,

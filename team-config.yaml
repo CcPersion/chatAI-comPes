@@ -1,0 +1,23 @@
+# Ai-Team 项目配置
+mode: standalone
+project:
+  name: "local-ai-companion-v2"
+  description: "基于 wav2lip256 + llama.cpp + faster-whisper + Qwen3-TTS 的本地 AI 赛博女友，WSL2 运行，WebRTC 数字人实时交互"
+  tech_stack:
+    - python          # speech-to-speech pipeline
+    - llama.cpp       # 大模型推理 (Qwen3-14B/8B Q4_K_M)
+    - faster-whisper  # 语音识别
+    - Qwen3-TTS       # 语音合成 + 声音克隆
+    - wav2lip256       # 口型同步
+    - LiveTalking      # WebRTC 数字人渲染
+    - Gradio           # 前端 UI（可后续升级为 React）
+    - WSL2 Ubuntu 24.04
+    - ComfyUI + Wan2.2 # 数字人 idle 视频生成（一次性）
+team_tier: standard
+profile: minimal
+strategy: effort_based
+base_timeouts: {creativity: 15, reasoning: 10, implementation: 8, mechanical: 5}
+effort_multiplier: {S: 1.0, M: 1.5, L: 2.5, XL: 4.0}
+escalation: {first_check: 0.7, second_check: 1.0, final_kill: 2.0}
+retry: {max_retries: 2, backoff: exponential}
+review: {max_rounds: 3, escalation: "Orchestrator裁决"}

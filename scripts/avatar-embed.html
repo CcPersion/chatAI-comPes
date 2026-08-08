@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a2e; }
+  video { width: 100%; height: 100%; object-fit: contain; object-position: right center; display: none; background: #0a0a14; }
+  #placeholder {
+    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: #ffffffaa; font-family: sans-serif; text-align: center;
+    pointer-events: none;
+  }
+  #placeholder .icon {
+    width: 64px; height: 64px; margin: 0 auto 16px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #a78bfa, #312e81 58%, #0f172a 100%);
+    box-shadow: 0 0 40px rgba(124, 58, 237, .3);
+  }
+  #placeholder .title { font-size: 18px; }
+  #placeholder .sub { font-size: 14px; color: #666; margin-top: 4px; }
+</style>
+</head>
+<body>
+<div id="placeholder">
+  <div>
+    <div class="icon">🫀</div>
+    <div class="title">数字人待机中...</div>
+    <div class="sub" id="status-text">正在连接...</div>
+  </div>
+</div>
+<video id="video" autoplay playsinline muted></video>
+
+<script>
+var pc = null;
+var videoEl = document.getElementById('video');
+var placeholder = document.getElementById('placeholder');
+var statusText = document.getElementById('status-text');
+
+function connect() {
+  var config = { sdpSemantics: 'unified-plan' };
+  pc = new RTCPeerConnection(config);
+
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+
+  pc.addEventListener('track', function(evt) {
+    if (evt.track.kind === 'video') {
+      // 建纯视频 stream，隔离 WebRTC 音频轨道（音频由外部 Gradio 播放）
+      var videoStream = new MediaStream([evt.track]);
+      videoEl.srcObject = videoStream;
+      videoEl.onloadedmetadata = function() {
+        placeholder.style.display = 'none';
+        videoEl.style.display = 'block';
+      };
+    }
+    // 忽略 audio track — 不连接到任何元素
+  });
+
+  pc.addEventListener('iceconnectionstatechange', function() {
+    statusText.textContent = 'ICE: ' + pc.iceConnectionState;
+    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+      statusText.textContent = '已连接';
+    }
+  });
+
+  pc.createOffer().then(function(offer) {
+    return pc.setLocalDescription(offer);
+  }).then(function() {
+    return new Promise(function(resolve) {
+      if (pc.iceGatheringState === 'complete') resolve();
+      else pc.addEventListener('icegatheringstatechange', function check() {
+        if (pc.iceGatheringState === 'complete') {
+          pc.removeEventListener('icegatheringstatechange', check);
+          resolve();
+        }
+      });
+    });
+  }).then(function() {
+    return fetch('/offer', {
+      body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type, sessionid: '0' }),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST'
+    });
+  }).then(function(resp) { return resp.json(); })
+  .then(function(answer) { return pc.setRemoteDescription(answer); })
+  .catch(function(e) {
+    statusText.textContent = '连接失败，请确认 LiveTalking 已启动';
+    console.error('WebRTC error:', e);
+  });
+}
+
+connect();
+</script>
+</body>
+</html>

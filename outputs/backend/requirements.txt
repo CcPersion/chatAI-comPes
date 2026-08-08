@@ -1,0 +1,67 @@
+# =============================================================================
+# requirements.txt — local-ai-companion-v2 Python 依赖
+# =============================================================================
+# 安装: pip install -r requirements.txt
+# 审计建议: 定期运行 `pip-audit` 检查已知漏洞（SEC-18）。
+# 所有版本已锁定，升级前请验证兼容性。
+# =============================================================================
+
+# ---- Gradio UI 框架 ----
+gradio==4.44.1
+gradio_client==1.3.0
+
+# ---- 音频处理 ----
+numpy==1.26.4
+scipy==1.14.1
+soundfile==0.12.1
+librosa==0.10.2
+pydub==0.25.1
+webrtcvad==2.0.10
+
+# ---- 语音识别 (faster-whisper) ----
+faster-whisper==1.0.3
+ctranslate2==4.4.0
+
+# ---- 大模型 (OpenAI 兼容客户端) ----
+httpx==0.27.2
+sseclient-py==1.8.0
+
+# ---- 语音合成 (Qwen3-TTS) ----
+# TTS 引擎依赖（按 Qwen3-TTS 官方要求，以下为常见依赖）:
+torch==2.4.1
+torchaudio==2.4.1
+transformers==4.45.2
+tokenizers==0.20.1
+accelerate==0.34.2
+einops==0.8.0
+onnxruntime-gpu==1.19.2
+sounddevice==0.5.1
+
+# ---- 音频格式支持 ----
+PyAudio==0.2.14
+audioread==3.0.1
+soxr==0.5.0
+
+# ---- 模型下载与管理 ----
+huggingface_hub==0.25.2  # CLI 工具通过 `huggingface_hub` 包提供（huggingface-cli 命令）
+
+# ---- 配置管理 ----
+pyyaml==6.0.2
+
+# ---- 工具库 ----
+requests==2.32.3
+python-multipart==0.0.12
+pillow==10.4.0
+
+# ---- 日志 ----
+# (使用标准库 logging，无需额外依赖)
+
+# ---- 性能监控 (可选) ----
+psutil==6.0.0
+
+# ---- 安全审计建议 (SEC-18) ----
+# 1. 运行 pip-audit 检查所有依赖的已知漏洞
+# 2. torch/torchaudio 来自 PyTorch 官方源，建议使用官方 wheel
+# 3. PyAudio 需要系统级 portaudio 库: sudo apt-get install portaudio19-dev
+# 4. onnxruntime-gpu 需要 CUDA 11.8+ 和 cuDNN
+# 5. faster-whisper 的 CTranslate2 需要 CUDA 环境
