@@ -61,7 +61,7 @@ LLM_WARMUP_ENABLED: true
 # ---------------------------------------------------------------------------
 VOXCPM_MODEL_ID: "VoxCPM2"
 VOXCPM_PROFILE: "balanced-v2"
-VOXCPM_MODEL_PATH: "~/setup/models/VoxCPM2"
+VOXCPM_MODEL_PATH: "/mnt/d/codexWorkSpec/chatAI-comPes/models/VoxCPM2"
 VOXCPM_REF_WAV: "~/setup/ref-fast.wav"
 VOXCPM_REF_TEXT: "大家好，我是主播，很多人在看我的视频之后呢，都说我讲话好温柔。"
 VOXCPM_SAMPLE_RATE: 48000
