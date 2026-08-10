@@ -28,6 +28,7 @@ import traceback
 import re
 import inspect
 import atexit
+import html
 from pathlib import Path
 from datetime import datetime
 from io import BytesIO
@@ -133,6 +134,8 @@ VOXCPM_PROFILE = str(config.get("VOXCPM_PROFILE", "balanced-v2"))
 VOXCPM_MODEL_PATH = os.path.expanduser(str(config.get("VOXCPM_MODEL_PATH", "~/setup/models/VoxCPM2")))
 VOXCPM_REF_WAV = os.path.expanduser(str(config.get("VOXCPM_REF_WAV", "")))
 VOXCPM_REF_TEXT = str(config.get("VOXCPM_REF_TEXT", ""))
+ACTIVE_REF_WAV = VOXCPM_REF_WAV
+ACTIVE_REF_TEXT = VOXCPM_REF_TEXT
 VOXCPM_SAMPLE_RATE = int(config.get("VOXCPM_SAMPLE_RATE", 48000))
 VOXCPM_WORKER_URL = str(config.get("VOXCPM_WORKER_URL", "http://127.0.0.1:8020")).rstrip("/")
 VOXCPM_LOCAL_FILES_ONLY = bool(config.get("VOXCPM_LOCAL_FILES_ONLY", True))
@@ -162,6 +165,14 @@ LOG_DIR = os.path.expanduser(str(config.get("LOG_DIR", "~/setup/logs")))
 _log_level = getattr(logging, LOG_LEVEL, logging.INFO)
 os.makedirs(LOG_DIR, exist_ok=True)
 _log_file = os.path.join(LOG_DIR, "voice-pipeline.log")
+
+LOG_SOURCE_PATHS = {
+    "应用": _log_file,
+    "VoxCPM": "/tmp/voxcpm-worker.log",
+    "数字人": "/tmp/livetalking.log",
+    "桥接": "/tmp/avatar-sync.log",
+}
+LOG_SOURCE_LABELS = {"全部": "全部服务", **LOG_SOURCE_PATHS}
 
 # 重配置根 logger 以应用配置中的日志级别和文件输出
 _root_logger = logging.getLogger()
@@ -1211,7 +1222,7 @@ def validate_ref_audio(file_path: str) -> Tuple[bool, str]:
 
     return True, ""
 
-def handle_audio_upload(uploaded_file) -> dict:
+def handle_audio_upload(uploaded_file, prompt_text: str = "") -> dict:
     """
     处理参考音频上传。
     SEC-05: 文件名防路径遍历，限制在 UPLOAD_DIR。
@@ -1220,6 +1231,7 @@ def handle_audio_upload(uploaded_file) -> dict:
     if uploaded_file is None:
         return error_response("TTS_ERR_002", "请上传 5-15 秒清晰单人声参考音频")
 
+    global ACTIVE_REF_WAV, ACTIVE_REF_TEXT
     try:
         # 安全：获取原始文件名并清除路径分隔符（防路径遍历）
         original_name = os.path.basename(str(uploaded_file) if isinstance(uploaded_file, str) else "ref_upload.wav")
@@ -1246,10 +1258,13 @@ def handle_audio_upload(uploaded_file) -> dict:
 
         logger.info(f"参考音频已保存: {save_path}")
         try:
-            worker_reply = _get_tts().update_ref_audio(save_path)
+            worker_reply = _get_tts().update_ref_audio(save_path, prompt_text.strip())
         except Exception as exc:
             logger.error("VoxCPM 参考音频更新失败: %s", exc)
             return error_response("TTS_WORKER_001", "参考音频已保存，但 VoxCPM 音色更新失败，请检查 Worker")
+        ACTIVE_REF_WAV = save_path
+        if prompt_text.strip():
+            ACTIVE_REF_TEXT = prompt_text.strip()
         return {
             "ok": True,
             "message": "参考音频上传成功，音色克隆已更新",
@@ -1261,6 +1276,154 @@ def handle_audio_upload(uploaded_file) -> dict:
     except Exception as e:
         logger.error(f"音频上传处理异常: {traceback.format_exc()}")
         return error_response("TTS_ERR_002", "参考音频上传处理失败", "")
+
+
+def get_runtime_settings() -> dict:
+    """Return a safe, user-facing snapshot of the current runtime settings."""
+    reference_exists = bool(ACTIVE_REF_WAV and os.path.isfile(ACTIVE_REF_WAV))
+    return {
+        "llm_model": LLM_MODEL,
+        "tts_model": VOXCPM_MODEL_ID,
+        "tts_profile": VOXCPM_PROFILE,
+        "tts_style": VOXCPM_STYLE_PROMPT or "默认",
+        "tts_sample_rate": f"{VOXCPM_SAMPLE_RATE} Hz",
+        "audio_gain": f"{AVATAR_AUDIO_GAIN:.1f}x",
+        "prebuffer": f"{AVATAR_PREBUFFER_MS} ms",
+        "reference_audio": "已配置" if reference_exists else "未配置",
+        "reference_text": ACTIVE_REF_TEXT or "未设置",
+        "local_files_only": "是" if VOXCPM_LOCAL_FILES_ONLY else "否",
+    }
+
+
+def render_runtime_settings(settings: Optional[dict] = None) -> str:
+    """Render settings without exposing local paths or internal endpoints."""
+    values = settings or get_runtime_settings()
+    rows = (
+        ("大模型", values["llm_model"]),
+        ("语音模型", f"{values['tts_model']} · {values['tts_profile']}"),
+        ("语速风格", values["tts_style"]),
+        ("采样率", values["tts_sample_rate"]),
+        ("播放增益", values["audio_gain"]),
+        ("播放预缓冲", values["prebuffer"]),
+        ("参考音频", values["reference_audio"]),
+        ("本地模型", values["local_files_only"]),
+    )
+    items = "".join(
+        f'<div class="settings-row"><span>{html.escape(str(label))}</span>'
+        f'<strong>{html.escape(str(value))}</strong></div>'
+        for label, value in rows
+    )
+    prompt = html.escape(str(values["reference_text"]))
+    return (
+        '<div class="settings-card">'
+        f"{items}"
+        f'<div class="settings-reference-text"><span>参考文本</span>'
+        f'<p>{prompt}</p></div>'
+        "</div>"
+    )
+
+
+def apply_reference_audio(file_path: Optional[str], prompt_text: str = "") -> dict:
+    """Apply a validated reference audio file after explicit user confirmation."""
+    if not file_path:
+        return error_response("TTS_ERR_002", "请选择参考音频后再应用")
+    return handle_audio_upload(file_path, prompt_text)
+
+
+def get_recent_logs(source: str = "全部", limit: int = 200) -> str:
+    """Read only allow-listed local service logs, capped to the latest lines."""
+    try:
+        line_limit = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        line_limit = 200
+    if source not in LOG_SOURCE_LABELS:
+        source = "全部"
+    sources = LOG_SOURCE_PATHS if source == "全部" else {source: LOG_SOURCE_PATHS[source]}
+    blocks = []
+    for label, path_value in sources.items():
+        path = Path(path_value)
+        try:
+            if not path.is_file():
+                content = "暂无日志"
+            else:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                content = "\n".join(lines[-line_limit:]) or "暂无日志"
+        except OSError:
+            content = "日志暂时不可读取"
+        blocks.append(f"【{label}】\n{content}")
+    return "\n\n".join(blocks)
+
+
+STATUS_LABELS = {
+    "llama": "大模型",
+    "asr": "语音识别",
+    "tts": "语音合成",
+    "livetalking": "数字人口型",
+    "avatar_sync": "页面桥接",
+}
+STATUS_TEXTS = {
+    "connected": "已连接",
+    "ready": "就绪",
+    "degraded": "降级",
+    "timeout": "超时",
+    "disconnected": "未连接",
+    "error": "错误",
+}
+
+
+def format_status_summary(status: dict) -> str:
+    overall = status.get("overall", "partial")
+    if overall == "ready":
+        label, tone = "系统正常", "ready"
+    else:
+        label, tone = "部分服务异常", "degraded"
+    return (
+        f'<div class="overall-status {tone}" role="status" aria-live="polite">'
+        f'<span class="status-dot {tone}"></span>{label}'
+        " · 点击左下角状态查看详情</div>"
+    )
+
+
+def format_status_details(status: dict) -> str:
+    rows = []
+    for key, label in STATUS_LABELS.items():
+        value = status.get(key, "disconnected")
+        text = STATUS_TEXTS.get(value, value)
+        rows.append(
+            f'<div class="service-status-row">'
+            f'<span><span class="status-dot {html.escape(value)}"></span>'
+            f'{html.escape(label)}</span><strong>{html.escape(text)}</strong></div>'
+        )
+    return '<div class="service-status-card">' + "".join(rows) + "</div>"
+
+
+def refresh_status_details() -> Tuple[str, str]:
+    """Probe services and return the compact summary plus detailed HTML."""
+    status = get_service_status()
+    return format_status_summary(status), format_status_details(status)
+
+
+def toggle_utility_panel(panel_name: str):
+    """Return Gradio visibility updates for one mutually-exclusive panel."""
+    names = {"settings": "设置", "logs": "日志", "status": "状态"}
+    selected = panel_name if panel_name in names else "status"
+    return (
+        gr.update(visible=True),
+        names[selected],
+        gr.update(visible=selected == "settings"),
+        gr.update(visible=selected == "logs"),
+        gr.update(visible=selected == "status"),
+    )
+
+
+def close_utility_panel():
+    """Close the shared utility drawer and all of its views."""
+    return (
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(visible=False),
+    )
 
 
 # =============================================================================
@@ -2019,6 +2182,147 @@ def create_ui():
         color: #7F8AA3 !important;
     }
 
+    /* ── Utility actions and overlay drawer ─────────────────────────────── */
+    .quick-actions {
+        position: fixed !important;
+        left: 28px !important;
+        bottom: 18px !important;
+        z-index: 45 !important;
+        display: flex !important;
+        align-items: center !important;
+        gap: 8px !important;
+        width: auto !important;
+        pointer-events: auto !important;
+    }
+    .quick-action {
+        min-width: 72px !important;
+        min-height: 44px !important;
+        padding: 9px 13px !important;
+        border: 1px solid rgba(148,163,184,0.18) !important;
+        border-radius: 12px !important;
+        background: rgba(15,23,42,0.78) !important;
+        color: #CBD5E1 !important;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.18) !important;
+        backdrop-filter: blur(16px) saturate(120%) !important;
+        cursor: pointer !important;
+        transition: background 180ms ease-out, border-color 180ms ease-out,
+            color 180ms ease-out, transform 180ms ease-out !important;
+    }
+    .quick-action:hover {
+        background: rgba(51,65,85,0.86) !important;
+        border-color: rgba(139,92,246,0.55) !important;
+        color: #F5F3FF !important;
+        transform: translateY(-1px) !important;
+    }
+    .quick-action:focus-visible,
+    .drawer-close:focus-visible,
+    .utility-drawer button:focus-visible,
+    .utility-drawer input:focus-visible,
+    .utility-drawer textarea:focus-visible {
+        outline: 2px solid #A78BFA !important;
+        outline-offset: 3px !important;
+    }
+    .utility-icon {
+        display: inline-flex !important;
+        width: 16px !important;
+        height: 16px !important;
+        margin-right: 6px !important;
+        vertical-align: -3px !important;
+    }
+    .utility-icon svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; }
+
+    .utility-drawer {
+        position: fixed !important;
+        left: 20px !important;
+        bottom: 76px !important;
+        z-index: 50 !important;
+        width: min(390px, calc(100vw - 40px)) !important;
+        max-height: calc(100vh - 112px) !important;
+        overflow: auto !important;
+        padding: 0 !important;
+        border: 1px solid rgba(148,163,184,0.2) !important;
+        border-radius: 18px !important;
+        background: rgba(12,18,32,0.94) !important;
+        box-shadow: 0 24px 70px rgba(0,0,0,0.46),
+            0 0 0 1px rgba(124,58,237,0.08) inset !important;
+        backdrop-filter: blur(24px) saturate(135%) !important;
+        animation: utility-drawer-in 180ms ease-out !important;
+    }
+    @keyframes utility-drawer-in {
+        from { opacity: 0; transform: translateY(8px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    .utility-drawer > .wrap,
+    .utility-drawer .form,
+    .utility-drawer .panel,
+    .utility-drawer .block {
+        border: none !important;
+        background: transparent !important;
+        box-shadow: none !important;
+    }
+    .utility-header {
+        display: flex !important;
+        align-items: center !important;
+        justify-content: space-between !important;
+        padding: 16px 18px 12px !important;
+        border-bottom: 1px solid rgba(148,163,184,0.14) !important;
+    }
+    .utility-title { color: #F8FAFC !important; font-size: 16px !important; font-weight: 600 !important; }
+    .drawer-close {
+        min-width: 40px !important;
+        min-height: 40px !important;
+        width: 40px !important;
+        height: 40px !important;
+        padding: 0 !important;
+        border-radius: 10px !important;
+        color: #94A3B8 !important;
+        background: rgba(51,65,85,0.32) !important;
+        border: 1px solid rgba(148,163,184,0.12) !important;
+    }
+    .utility-view { padding: 14px 18px 18px !important; }
+    .utility-view h3, .utility-view h4 { color: #E2E8F0 !important; margin: 4px 0 10px !important; }
+    .utility-help { color: #94A3B8 !important; font-size: 12px !important; line-height: 1.55 !important; }
+    .utility-status { color: #CBD5E1 !important; font-size: 12px !important; line-height: 1.5 !important; }
+    .settings-card, .service-status-card {
+        padding: 10px 12px !important;
+        border: 1px solid rgba(148,163,184,0.13) !important;
+        border-radius: 12px !important;
+        background: rgba(15,23,42,0.46) !important;
+    }
+    .settings-row, .service-status-row {
+        display: flex !important;
+        align-items: center !important;
+        justify-content: space-between !important;
+        gap: 14px !important;
+        min-height: 30px !important;
+        color: #94A3B8 !important;
+        font-size: 12px !important;
+        border-bottom: 1px solid rgba(148,163,184,0.08) !important;
+    }
+    .settings-row:last-child, .service-status-row:last-child { border-bottom: none !important; }
+    .settings-row strong, .service-status-row strong { color: #E2E8F0 !important; font-weight: 500 !important; text-align: right !important; }
+    .settings-reference-text { padding-top: 10px !important; color: #94A3B8 !important; font-size: 12px !important; }
+    .settings-reference-text p { color: #CBD5E1 !important; line-height: 1.55 !important; margin: 6px 0 0 !important; word-break: break-word !important; }
+    .utility-drawer .secondary, .utility-drawer button { min-height: 40px !important; }
+    .utility-drawer .primary { background: linear-gradient(135deg, #7C3AED, #6366F1) !important; border: none !important; }
+    .utility-log { min-height: 260px !important; max-height: 420px !important; }
+    .utility-log textarea, .utility-log pre {
+        font-family: 'JetBrains Mono', 'Cascadia Mono', monospace !important;
+        font-size: 11px !important;
+        line-height: 1.55 !important;
+        color: #CBD5E1 !important;
+        background: rgba(2,6,23,0.72) !important;
+    }
+    .overall-status {
+        display: inline-block !important;
+        color: #94A3B8 !important;
+        font-size: 11px !important;
+        line-height: 1.5 !important;
+        margin: 4px 0 0 !important;
+    }
+    .overall-status.ready { color: #86EFAC !important; }
+    .overall-status.degraded { color: #FCD34D !important; }
+
     /* ── Custom scrollbar ──────────────────────────────────────────────────── */
     .chat-panel::-webkit-scrollbar { width: 3px; }
     .chat-panel::-webkit-scrollbar-track { background: transparent; }
@@ -2050,6 +2354,9 @@ def create_ui():
         }
         .left-zone::after { display: none !important; }
         .voice-ball-btn { width: 132px !important; height: 132px !important; }
+        .quick-actions { left: 18px !important; bottom: 12px !important; }
+        .quick-action { min-width: 44px !important; padding: 9px 10px !important; font-size: 12px !important; }
+        .utility-drawer { left: 12px !important; bottom: 68px !important; width: calc(100vw - 24px) !important; max-height: calc(100vh - 96px) !important; }
     }
 
     /* ── Accessibility ─────────────────────────────────────────────────────── */
@@ -2087,6 +2394,31 @@ def create_ui():
 
         document.addEventListener('pointerdown', unlockAudio, { capture: true });
         document.addEventListener('keydown', unlockAudio, { capture: true });
+        const utilityIcons = {
+            'utility-settings': '<span class="utility-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="m19.4 15 .1.1a2 2 0 0 1-2.8 2.8l-.1-.1a2 2 0 0 0-3.4 1.4V19a2 2 0 0 1-4 0v-.2a2 2 0 0 0-3.4-1.4l-.1.1a2 2 0 0 1-2.8-2.8l.1-.1A2 2 0 0 0 1.6 11H1.5a2 2 0 0 1 0-4h.2a2 2 0 0 0 1.4-3.4L3 3.5A2 2 0 0 1 5.8.7l.1.1A2 2 0 0 0 9.3-.6V0a2 2 0 0 1 4 0v.2a2 2 0 0 0 3.4 1.4l.1-.1a2 2 0 0 1 2.8 2.8l-.1.1A2 2 0 0 0 20.9 8h.2a2 2 0 0 1 0 4h-.2a2 2 0 0 0-1.5 3Z"/></svg></span>',
+            'utility-logs': '<span class="utility-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M8 8h8M8 12h8M8 16h5"/></svg></span>',
+            'utility-status': '<span class="utility-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="8" cy="6" r="1.5"/><circle cx="16" cy="12" r="1.5"/><circle cx="10" cy="18" r="1.5"/></svg></span>'
+        };
+        const mountUtilityIcons = () => {
+            Object.entries(utilityIcons).forEach(([id, icon]) => {
+                const element = document.querySelector('#' + id);
+                const button = element && element.tagName === 'BUTTON'
+                    ? element : element && element.querySelector('button');
+                if (button && !button.querySelector('.utility-icon')) {
+                    button.insertAdjacentHTML('afterbegin', icon);
+                }
+            });
+        };
+        mountUtilityIcons();
+        window.setTimeout(mountUtilityIcons, 300);
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') {
+                const closeElement = document.querySelector('#utility-close');
+                const closeButton = closeElement && closeElement.tagName === 'BUTTON'
+                    ? closeElement : closeElement && closeElement.querySelector('button');
+                if (closeButton) closeButton.click();
+            }
+        });
         window.setInterval(notifyAvatar, 1000);
     }
     """
@@ -2153,6 +2485,19 @@ def create_ui():
                 connection_html = gr.HTML(
                     value='<div class="status-line">检测中...</div>',
                 )
+                with gr.Row(elem_classes=["quick-actions"]):
+                    settings_btn = gr.Button(
+                        "设置", elem_id="utility-settings",
+                        elem_classes=["quick-action"], scale=0,
+                    )
+                    logs_btn = gr.Button(
+                        "日志", elem_id="utility-logs",
+                        elem_classes=["quick-action"], scale=0,
+                    )
+                    status_btn = gr.Button(
+                        "状态", elem_id="utility-status",
+                        elem_classes=["quick-action"], scale=0,
+                    )
 
             # ---- 右 1/3: 数字人视频 ----
             with gr.Column(scale=1, elem_classes=["right-zone"]):
@@ -2169,6 +2514,57 @@ def create_ui():
                 avatar_html_kwargs = {"value": avatar_html, "show_label": False}
                 avatar_video = gr.HTML(**avatar_html_kwargs)
 
+        # ---- 左下角工具抽屉：fixed overlay，不参与主布局尺寸计算 ----
+        with gr.Column(
+            visible=False, elem_id="utility-drawer",
+            elem_classes=["utility-drawer"],
+        ) as utility_drawer:
+            with gr.Row(elem_classes=["utility-header"]):
+                utility_title = gr.Markdown("设置", elem_classes=["utility-title"])
+                drawer_close = gr.Button(
+                    "关闭", elem_id="utility-close",
+                    elem_classes=["drawer-close"], scale=0,
+                )
+
+            with gr.Column(visible=False, elem_classes=["utility-view"]) as settings_view:
+                gr.Markdown("### 运行设置")
+                settings_summary = gr.HTML(render_runtime_settings())
+                gr.Markdown(
+                    "参考音频只会在点击“应用设置”后更新。模型路径、服务地址等运行参数仅展示，不在网页中修改。",
+                    elem_classes=["utility-help"],
+                )
+                ref_audio_upload = gr.Audio(
+                    sources=["upload"], type="filepath", label="参考音频",
+                )
+                reference_text_input = gr.Textbox(
+                    value=ACTIVE_REF_TEXT, label="参考文本",
+                    lines=3, max_lines=5,
+                )
+                apply_settings_btn = gr.Button(
+                    "应用设置", variant="primary", elem_classes=["utility-apply"],
+                )
+                settings_result = gr.Markdown(elem_classes=["utility-status"])
+
+            with gr.Column(visible=False, elem_classes=["utility-view"]) as logs_view:
+                gr.Markdown("### 最近日志")
+                with gr.Row():
+                    logs_source = gr.Dropdown(
+                        choices=["全部", "应用", "VoxCPM", "数字人", "桥接"],
+                        value="全部", label="服务", scale=2,
+                    )
+                    logs_refresh_btn = gr.Button("刷新", scale=0, min_width=72)
+                logs_output = gr.Code(
+                    value="点击刷新查看最近日志。", language="shell",
+                    lines=18, interactive=False, show_label=False,
+                    elem_classes=["utility-log"],
+                )
+
+            with gr.Column(visible=False, elem_classes=["utility-view"]) as status_view:
+                gr.Markdown("### 服务状态")
+                status_summary = gr.HTML('<div class="utility-status">点击刷新获取状态。</div>')
+                status_details = gr.HTML('<div class="utility-status">尚未检测。</div>')
+                status_refresh_btn = gr.Button("刷新状态", variant="secondary")
+
         # ---- 浮动音频播放条（自动播放TTS语音） ----
         tts_audio_output = gr.Audio(
             type="filepath", format="wav", interactive=False,
@@ -2183,9 +2579,6 @@ def create_ui():
         audio_input = gr.Audio(
             sources=["microphone"], type="numpy", visible=False,
             elem_id="voice-mic-recorder",
-        )
-        ref_audio_upload = gr.Audio(
-            sources=["upload"], type="filepath", visible=False,
         )
         upload_status = gr.Textbox(visible=False)
 
@@ -2397,32 +2790,74 @@ def create_ui():
             return gr.skip(), "已停止"
 
         def update_connection_status():
-            svc = get_service_status()
-            dots = {
-                "connected": '<span class="status-dot connected"></span>',
-                "disconnected": '<span class="status-dot disconnected"></span>',
-                "degraded": '<span class="status-dot degraded"></span>',
-                "ready": '<span class="status-dot ready"></span>',
-                "timeout": '<span class="status-dot timeout"></span>',
-                "error": '<span class="status-dot error"></span>',
-            }
-            labels = {
-                "llama": "LLM",
-                "asr": "ASR",
-                "tts": "TTS",
-                "livetalking": "口型",
-                "avatar_sync": "桥接",
-            }
-            parts = []
-            for key, label in labels.items():
-                s = svc.get(key, "disconnected")
-                parts.append(f'{dots.get(s, dots["disconnected"])} {label}')
-            return '<div class="status-line">' + " &nbsp;".join(parts) + '</div>'
+            return format_status_summary(get_service_status())
 
         def update_status_display():
             return state_machine.state_text, update_connection_status()
 
+        def open_settings_panel():
+            drawer_state = toggle_utility_panel("settings")
+            return (
+                *drawer_state,
+                render_runtime_settings(),
+                ACTIVE_REF_TEXT,
+                "",
+            )
+
+        def open_logs_panel(source):
+            return (*toggle_utility_panel("logs"), get_recent_logs(source))
+
+        def open_status_panel():
+            summary, details = refresh_status_details()
+            return (*toggle_utility_panel("status"), summary, details)
+
+        def apply_settings_ui(file_path, prompt_text):
+            result = apply_reference_audio(file_path, prompt_text or "")
+            if result.get("ok"):
+                message = result.get("message", "设置已应用")
+                return render_runtime_settings(), message
+            error = result.get("error", {})
+            return render_runtime_settings(), error.get("message", "设置应用失败")
+
         # ---- 绑定事件 ----
+        settings_btn.click(
+            fn=open_settings_panel,
+            inputs=[],
+            outputs=[
+                utility_drawer, utility_title, settings_view, logs_view,
+                status_view, settings_summary, reference_text_input, settings_result,
+            ],
+        )
+        logs_btn.click(
+            fn=open_logs_panel,
+            inputs=[logs_source],
+            outputs=[utility_drawer, utility_title, settings_view, logs_view, status_view, logs_output],
+        )
+        status_btn.click(
+            fn=open_status_panel,
+            inputs=[],
+            outputs=[utility_drawer, utility_title, settings_view, logs_view, status_view, status_summary, status_details],
+        )
+        drawer_close.click(
+            fn=close_utility_panel,
+            inputs=[],
+            outputs=[utility_drawer, settings_view, logs_view, status_view],
+        )
+        apply_settings_btn.click(
+            fn=apply_settings_ui,
+            inputs=[ref_audio_upload, reference_text_input],
+            outputs=[settings_summary, settings_result],
+        )
+        logs_refresh_btn.click(
+            fn=get_recent_logs,
+            inputs=[logs_source],
+            outputs=[logs_output],
+        )
+        status_refresh_btn.click(
+            fn=refresh_status_details,
+            inputs=[],
+            outputs=[status_summary, status_details],
+        )
         send_btn.click(
             fn=handle_text_input,
             inputs=[text_input],
