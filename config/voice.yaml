@@ -36,7 +36,7 @@ ASR_LANG: "zh"
 # ---------------------------------------------------------------------------
 # LLM (Large Language Model) 大模型
 # ---------------------------------------------------------------------------
-LLM_BASE_URL: "http://172.19.80.1:11434"
+LLM_BASE_URL: "http://172.18.160.1:11434"
 # llama.cpp llama-server 的地址（WSL2 内通过 localhostForwarding 访问 Windows 侧服务）。
 # 若 localhostForwarding 不可用，改为 Windows 主机 IP（见 /etc/resolv.conf 中的 nameserver），
 # 如 "http://172.30.96.1:8090"。
