@@ -47,6 +47,7 @@ class LiveTalkingAudioPlayout:
         max_buffer_ms: int = 6000,
         gain: float = 1.0,
         fade_in_ms: int = 30,
+        lead_in_ms: int = 0,
         post: Callable = requests.post,
     ) -> None:
         if output_rate <= 0 or frame_ms <= 0:
@@ -69,6 +70,7 @@ class LiveTalkingAudioPlayout:
         self.fade_in_samples = max(
             0, int(round(self.output_rate * fade_in_ms / 1000))
         )
+        self.lead_in_frames = max(0, int(round(lead_in_ms / frame_ms)))
         self._post = post
 
         # The logical size limit is enforced with the condition below.  Using
@@ -191,6 +193,13 @@ class LiveTalkingAudioPlayout:
         self._pending = np.empty(0, dtype=np.float32)
         self._fade_remaining = self.fade_in_samples
         self._utterances += 1
+        # Give WebRTC/LiveTalking a short run of clocked silence before speech.
+        # This primes the downstream audio/video path without changing pitch or
+        # inserting discontinuities into the first synthesized samples.
+        for _ in range(self.lead_in_frames):
+            self._put_frame_locked(
+                np.zeros(self.frame_samples, dtype=np.float32)
+            )
 
     def _apply_fade_locked(self, audio: np.ndarray) -> np.ndarray:
         if not audio.size or self._fade_remaining <= 0:

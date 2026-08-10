@@ -67,6 +67,8 @@ VOXCPM_REF_TEXT: "大家好，我是主播，很多人在看我的视频之后�
 VOXCPM_SAMPLE_RATE: 48000
 VOXCPM_WORKER_URL: "http://127.0.0.1:8020"
 VOXCPM_LOCAL_FILES_ONLY: true
+VOXCPM_STYLE_PROMPT: "语速自然"
+# VoxCPM2 原生括号指令，只影响合成语音，不改变聊天界面文本。
 # 预热音频只用于后台热身，不在正式回答前播放，避免等待阶段出现杂音。
 # CosyVoice3 首块 token 数；更小首块更快，后续块自动放大保持音质。
 # VoxCPM2 uses a 48kHz stream; switch the profile and sample rate together
@@ -91,9 +93,11 @@ AVATAR_PREBUFFER_MS: 1200
 AVATAR_REBUFFER_MS: 400
 AVATAR_MAX_BUFFER_MS: 6000
 AVATAR_AUDIO_GAIN: 1.0
-AVATAR_FADE_IN_MS: 30
+AVATAR_FADE_IN_MS: 80
+AVATAR_LEAD_IN_MS: 200
 # VoxCPM remains 48 kHz. The app performs one stateful 48 kHz -> 16 kHz
-# conversion, buffers 1.2 s, then feeds LiveTalking on an exact 20 ms clock.
+# conversion, buffers 1.2 s, primes WebRTC with 200 ms of silence, then feeds
+# LiveTalking on an exact 20 ms clock with a gentle 80 ms speech fade-in.
 # This value reflects the measured VoxCPM2 generation jitter on the RTX 5060 Ti.
 # Lowering it reduces latency but makes sentence-boundary stalls more likely.
 # LiveTalking 服务地址（WSL2 内）。

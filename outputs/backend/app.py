@@ -136,6 +136,7 @@ VOXCPM_REF_TEXT = str(config.get("VOXCPM_REF_TEXT", ""))
 VOXCPM_SAMPLE_RATE = int(config.get("VOXCPM_SAMPLE_RATE", 48000))
 VOXCPM_WORKER_URL = str(config.get("VOXCPM_WORKER_URL", "http://127.0.0.1:8020")).rstrip("/")
 VOXCPM_LOCAL_FILES_ONLY = bool(config.get("VOXCPM_LOCAL_FILES_ONLY", True))
+VOXCPM_STYLE_PROMPT = str(config.get("VOXCPM_STYLE_PROMPT", "")).strip()
 LIVETALKING_URL = str(config.get("LIVETALKING_URL", "http://localhost:8010"))
 AVATAR_OUTPUT_SAMPLE_RATE = int(config.get("AVATAR_OUTPUT_SAMPLE_RATE", 16000))
 AVATAR_FRAME_MS = int(config.get("AVATAR_FRAME_MS", 20))
@@ -144,6 +145,7 @@ AVATAR_REBUFFER_MS = int(config.get("AVATAR_REBUFFER_MS", 400))
 AVATAR_MAX_BUFFER_MS = int(config.get("AVATAR_MAX_BUFFER_MS", 6000))
 AVATAR_AUDIO_GAIN = float(config.get("AVATAR_AUDIO_GAIN", 1.0))
 AVATAR_FADE_IN_MS = int(config.get("AVATAR_FADE_IN_MS", 30))
+AVATAR_LEAD_IN_MS = int(config.get("AVATAR_LEAD_IN_MS", 0))
 AVATAR_SYNC_URL = str(config.get("AVATAR_SYNC_URL", "http://localhost:8011"))
 UPLOAD_DIR = os.path.expanduser(str(config.get("UPLOAD_DIR", "~/setup/uploads")))
 MAX_UPLOAD_SIZE_MB = int(config.get("MAX_UPLOAD_SIZE_MB", 15))
@@ -1165,7 +1167,10 @@ def _get_tts() -> VoxCPMClient:
     if tts_engine is None:
         with _tts_init_lock:
             if tts_engine is None:
-                tts_engine = VoxCPMClient(VOXCPM_WORKER_URL)
+                tts_engine = VoxCPMClient(
+                    VOXCPM_WORKER_URL,
+                    style_prompt=VOXCPM_STYLE_PROMPT,
+                )
     return tts_engine
 
 # =============================================================================
@@ -1310,6 +1315,7 @@ class ConversationPipeline:
                     max_buffer_ms=AVATAR_MAX_BUFFER_MS,
                     gain=AVATAR_AUDIO_GAIN,
                     fade_in_ms=AVATAR_FADE_IN_MS,
+                    lead_in_ms=AVATAR_LEAD_IN_MS,
                 )
                 if old_stream is not None:
                     old_stream.close()

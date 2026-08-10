@@ -5,6 +5,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "outputs" / "backend"))
 from voxcpm_worker import GenerationRegistry, VoxCPMRuntime, profile_spec
+from voxcpm_client import VoxCPMClient
 
 
 def test_health_and_version_observe_profile_model_and_sample_rate():
@@ -68,3 +69,12 @@ def test_reference_audio_update_rejects_paths_outside_upload_root(tmp_path):
         pass
     else:
         raise AssertionError("reference path outside upload root must be rejected")
+
+
+def test_client_applies_native_style_prompt_without_changing_empty_text():
+    client = VoxCPMClient(
+        "http://worker.test",
+        style_prompt="（语速稍慢，停顿清晰）",
+    )
+    assert client.prepare_text(" 你好。 ") == "(语速稍慢，停顿清晰)你好。"
+    assert client.prepare_text("   ") == ""

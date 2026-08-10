@@ -14,10 +14,23 @@ import numpy as np
 
 
 class VoxCPMClient:
-    def __init__(self, base_url: str, timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        timeout: float = 10.0,
+        style_prompt: str = "",
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.style_prompt = style_prompt.strip().strip("()（）")
         self.last_event: Optional[Dict[str, Any]] = None
+
+    def prepare_text(self, text: str) -> str:
+        """Apply VoxCPM2's native parenthesized speaking-style control."""
+        cleaned = text.strip()
+        if not cleaned or not self.style_prompt:
+            return cleaned
+        return f"({self.style_prompt}){cleaned}"
 
     def _get(self, path: str) -> Dict[str, Any]:
         with urllib.request.urlopen(self.base_url + path, timeout=self.timeout) as response:
@@ -34,7 +47,7 @@ class VoxCPMClient:
         request_id = request_id or "req_" + uuid.uuid4().hex
         generation_id = generation_id or "gen_" + uuid.uuid4().hex
         conversation_id = conversation_id or "conv_" + uuid.uuid4().hex
-        payload = json.dumps({"text": text, "request_id": request_id, "generation_id": generation_id, "conversation_id": conversation_id}).encode("utf-8")
+        payload = json.dumps({"text": self.prepare_text(text), "request_id": request_id, "generation_id": generation_id, "conversation_id": conversation_id}).encode("utf-8")
         request = urllib.request.Request(self.base_url + "/api/tts/synthesize", data=payload, headers={"Content-Type": "application/json", "Accept": "application/x-ndjson"}, method="POST")
         expected_sequence = 0
         expected_sample_rate: Optional[int] = None

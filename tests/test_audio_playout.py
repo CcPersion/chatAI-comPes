@@ -110,3 +110,25 @@ def test_playout_does_not_start_before_prebuffer_threshold():
     assert playout.wait_until_idle(timeout=2.0)
     playout.close()
     assert len(post.frames) >= 5
+
+
+def test_playout_primes_webrtc_with_silence_before_faded_speech():
+    post = _RecordingPost()
+    playout = LiveTalkingAudioPlayout(
+        "http://livetalking.test",
+        prebuffer_ms=100,
+        max_buffer_ms=1000,
+        fade_in_ms=80,
+        lead_in_ms=60,
+        post=post,
+    )
+    _send_in_model_chunks(playout, _tone(seconds=0.32))
+    playout.close()
+
+    first_frames = [np.frombuffer(frame, dtype="<i2") for frame in post.frames[:3]]
+    assert len(first_frames) == 3
+    assert all(np.count_nonzero(frame) == 0 for frame in first_frames)
+    assert any(
+        np.count_nonzero(np.frombuffer(frame, dtype="<i2")) > 0
+        for frame in post.frames[3:]
+    )
