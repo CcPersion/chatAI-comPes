@@ -79,3 +79,20 @@ completed: 2026-08-05
 - RTX 5060 Ti detected: 16,311 MiB total; current free memory varies with other processes.
 - Real VoxCPM model load, GPU peak VRAM, warm P50/P95, blind listening, interruption latency, and browser/LiveTalking acceptance: not yet verified.
 - `CONSTITUTION.md` is not present in the repository; the security baseline remains pending rather than claimed complete.
+
+## Phase 8: WebRTC reconnect audio-session lifecycle fix (current)
+
+| Stage | Owner | Result | Evidence |
+|---|---|---|---|
+| Root-cause gate | Orchestrator | pass | VoxCPM emitted PCM; persistent `/humanaudio/stream` remained attached to a stale avatar object after WebRTC reconnect |
+| Developer | Developer | pass | Identity-aware session removal patch, per-frame session rebound, and idempotent startup application |
+| QA | QA | pass with product-acceptance warning | Static checks, WSL compile, identity-race regression, four listeners, and current-session audio event passed |
+| Reviewer | Reviewer | pass with non-blocking warnings | 91/94/82; blocker 0; engineering fix accepted, user hearing/lip-sync confirmation still required |
+
+### Phase 8 gate
+
+- Lifecycle and Clocked-v3 patches are deployed in `/root/setup`; Windows and WSL startup scripts have matching SHA-256.
+- Stale `expected_session` removal leaves the current session mapped; matching removal succeeds.
+- Current browser WebRTC session reconnected, the backend-triggered reply rebound to that session, emitted `start`, and completed 20 audio chunks without underflow.
+- Ports 7860, 8010, 8011, and 8020 listen in WSL; Windows localhost returns HTTP 200 for 7860 and HTTP 302 for 8010.
+- No second browser session was opened. Actual user-perceived audio, mouth movement, and A/V sync remain a manual acceptance item.

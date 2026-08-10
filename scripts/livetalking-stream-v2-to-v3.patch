@@ -1,0 +1,52 @@
+diff --git a/LiveTalking/server/routes.py b/LiveTalking/server/routes.py
+--- a/LiveTalking/server/routes.py
++++ b/LiveTalking/server/routes.py
+@@ -110,6 +110,6 @@ async def humanaudio(request):
+
+ async def humanaudio_stream(request):
+-    """Clocked-v2: receive pre-framed 16k pcm_s16le from the app scheduler."""
++    """Clocked-v3: route each frame to the current WebRTC session object."""
+     try:
+         sessionid = str(
+             request.query.get('sessionid')
+@@ -136,10 +136,25 @@ async def humanaudio_stream(request):
+         pending = bytearray()
+         first_frame = True
+         emitted = False
++        bound_session = None
+
+-        def emit_frame(frame, status):
+-            datainfo = {'status': status} if status else {}
+-            avatar_session.put_audio_frame(frame, datainfo)
++        def emit_frame(frame, status=''):
++            nonlocal bound_session, first_frame
++            current_session = get_session(request, sessionid)
++            if current_session is None:
++                return False
++            if current_session is not bound_session:
++                bound_session = current_session
++                first_frame = True
++                logger.info(
++                    'humanaudio_stream rebound sessionid=%s object=%s',
++                    sessionid, id(current_session)
++                )
++            event_status = status or ('start' if first_frame else '')
++            datainfo = {'status': event_status} if event_status else {}
++            current_session.put_audio_frame(frame, datainfo)
++            first_frame = False
++            return True
+
+         async for data in request.content.iter_chunked(4096):
+             pending.extend(data)
+@@ -151,9 +166,8 @@ async def humanaudio_stream(request):
+                     bytes(pending[:frame_bytes]), dtype='<i2'
+                 ).astype(np.float32) / 32768.0
+                 del pending[:frame_bytes]
+-                emit_frame(frame, 'start' if first_frame else '')
+-                first_frame = False
+-                emitted = True
++                if emit_frame(frame):
++                    emitted = True
+
+         # The app keeps this request open across replies. On application
+         # shutdown, emit one clean zero frame carrying the final event.

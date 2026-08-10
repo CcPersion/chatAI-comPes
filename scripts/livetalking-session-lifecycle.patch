@@ -1,0 +1,33 @@
+diff --git a/LiveTalking/server/session_manager.py b/LiveTalking/server/session_manager.py
+--- a/LiveTalking/server/session_manager.py
++++ b/LiveTalking/server/session_manager.py
+@@ -82,6 +82,19 @@ class SessionManager:
+-    def remove_session(self, sessionid: str):
++    def remove_session(
++        self,
++        sessionid: str,
++        expected_session: Optional[BaseAvatar] = None,
++    ) -> bool:
+         """销毁会话资源"""
++        current_session = self.sessions.get(sessionid)
+-        if sessionid in self.sessions:
++
++        if expected_session is not None and current_session is not expected_session:
++            logger.info(f"Ignoring stale removal for session {sessionid}")
++            return False
++
++        if current_session is not None:
+             logger.info(f"Removing session {sessionid}")
+             # todo: 还可以主动调 avatar_session 释放
+             self.sessions.pop(sessionid, None)
++            return True
++
++        return False
+diff --git a/LiveTalking/server/rtc_manager.py b/LiveTalking/server/rtc_manager.py
+--- a/LiveTalking/server/rtc_manager.py
++++ b/LiveTalking/server/rtc_manager.py
+@@ -56,1 +56,3 @@
+-                session_manager.remove_session(sessionid)
++                session_manager.remove_session(
++                    sessionid, expected_session=avatar_session
++                )

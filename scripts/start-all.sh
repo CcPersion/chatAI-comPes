@@ -33,14 +33,32 @@ fuser -k 8020/tcp 2>/dev/null || true
 sleep 2
 
 echo "=== 启动 LiveTalking (8010) ==="
+LIVETALKING_LIFECYCLE_PATCH="$ROOT_DIR/scripts/livetalking-session-lifecycle.patch"
+LIVETALKING_RTC_MANAGER="$ROOT_DIR/LiveTalking/server/rtc_manager.py"
+
+if [[ ! -f "$LIVETALKING_LIFECYCLE_PATCH" ]]; then
+  echo "ERROR: LiveTalking session lifecycle patch is missing: $LIVETALKING_LIFECYCLE_PATCH" >&2
+  exit 3
+fi
+
+if ! grep -Fq "expected_session=avatar_session" "$LIVETALKING_RTC_MANAGER"; then
+  echo "=== 应用 LiveTalking 会话生命周期补丁 ==="
+  patch --batch -p1 -d "$ROOT_DIR" < "$LIVETALKING_LIFECYCLE_PATCH"
+fi
+
+if grep -q "Clocked-v2" "$ROOT_DIR/LiveTalking/server/routes.py"; then
+  echo "=== 升级 LiveTalking 会话重绑定补丁 ==="
+  patch --batch -p1 -d "$ROOT_DIR" \
+    < "$ROOT_DIR/scripts/livetalking-stream-v2-to-v3.patch"
+fi
 if grep -q "async def humanaudio_stream" "$ROOT_DIR/LiveTalking/server/routes.py" && \
-   ! grep -q "Clocked-v2" "$ROOT_DIR/LiveTalking/server/routes.py"; then
+   ! grep -q "Clocked-v3" "$ROOT_DIR/LiveTalking/server/routes.py"; then
   echo "=== 升级 LiveTalking 固定时钟音频流补丁 ==="
   patch --batch -R -p1 -d "$ROOT_DIR" \
     < "$ROOT_DIR/scripts/livetalking-stream-v1.patch"
 fi
 if [[ -f "$ROOT_DIR/scripts/livetalking-stream.patch" ]] && \
-   ! grep -q "Clocked-v2" "$ROOT_DIR/LiveTalking/server/routes.py"; then
+   ! grep -q "Clocked-v3" "$ROOT_DIR/LiveTalking/server/routes.py"; then
   echo "=== 应用 LiveTalking 持续音频流补丁 ==="
   patch --batch -p1 -d "$ROOT_DIR" \
     < "$ROOT_DIR/scripts/livetalking-stream.patch"
