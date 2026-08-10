@@ -2210,8 +2210,8 @@ def create_ui():
     }
     .quick-action:hover {
         background: rgba(51,65,85,0.86) !important;
-        border-color: rgba(139,92,246,0.55) !important;
-        color: #F5F3FF !important;
+        border-color: rgba(169,205,175,0.48) !important;
+        color: #F3F8F4 !important;
         transform: translateY(-1px) !important;
     }
     .quick-action:focus-visible,
@@ -2219,7 +2219,7 @@ def create_ui():
     .utility-drawer button:focus-visible,
     .utility-drawer input:focus-visible,
     .utility-drawer textarea:focus-visible {
-        outline: 2px solid #A78BFA !important;
+        outline: 2px solid #A9CDAF !important;
         outline-offset: 3px !important;
     }
     .utility-icon {
@@ -2232,6 +2232,16 @@ def create_ui():
     .utility-icon svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; }
 
     .utility-drawer {
+        --utility-bg: rgba(25, 29, 36, 0.97);
+        --utility-surface: rgba(255, 255, 255, 0.035);
+        --utility-surface-strong: rgba(255, 255, 255, 0.065);
+        --utility-border: rgba(255, 255, 255, 0.11);
+        --utility-divider: rgba(255, 255, 255, 0.075);
+        --utility-text: #F3F5F7;
+        --utility-body: #D3D9E0;
+        --utility-muted: #A7B0BA;
+        --utility-accent: #A9CDAF;
+        --utility-accent-bg: rgba(91, 127, 98, 0.34);
         position: fixed !important;
         left: 20px !important;
         bottom: 76px !important;
@@ -2240,87 +2250,246 @@ def create_ui():
         max-height: calc(100vh - 112px) !important;
         overflow: auto !important;
         padding: 0 !important;
-        border: 1px solid rgba(148,163,184,0.2) !important;
-        border-radius: 18px !important;
-        background: rgba(12,18,32,0.94) !important;
-        box-shadow: 0 24px 70px rgba(0,0,0,0.46),
-            0 0 0 1px rgba(124,58,237,0.08) inset !important;
-        backdrop-filter: blur(24px) saturate(135%) !important;
+        color: var(--utility-body) !important;
+        border: 1px solid var(--utility-border) !important;
+        border-radius: 16px !important;
+        background: var(--utility-bg) !important;
+        box-shadow: 0 24px 70px rgba(0,0,0,0.52),
+            0 0 0 1px rgba(255,255,255,0.025) inset !important;
+        backdrop-filter: blur(24px) saturate(115%) !important;
         animation: utility-drawer-in 180ms ease-out !important;
+        scrollbar-color: rgba(169,205,175,0.38) transparent !important;
+        scrollbar-width: thin !important;
     }
     @keyframes utility-drawer-in {
         from { opacity: 0; transform: translateY(8px); }
         to { opacity: 1; transform: translateY(0); }
     }
-    .utility-drawer > .wrap,
-    .utility-drawer .form,
-    .utility-drawer .panel,
-    .utility-drawer .block {
+    #utility-drawer > .wrap,
+    #utility-drawer .form,
+    #utility-drawer .panel,
+    #utility-drawer .block {
         border: none !important;
         background: transparent !important;
         box-shadow: none !important;
+    }
+    #utility-drawer::-webkit-scrollbar,
+    #utility-drawer textarea::-webkit-scrollbar { width: 6px !important; height: 6px !important; }
+    #utility-drawer::-webkit-scrollbar-track,
+    #utility-drawer textarea::-webkit-scrollbar-track { background: transparent !important; }
+    #utility-drawer::-webkit-scrollbar-thumb,
+    #utility-drawer textarea::-webkit-scrollbar-thumb {
+        border-radius: 999px !important;
+        background: rgba(169,205,175,0.34) !important;
     }
     .utility-header {
         display: flex !important;
         align-items: center !important;
         justify-content: space-between !important;
         padding: 16px 18px 12px !important;
-        border-bottom: 1px solid rgba(148,163,184,0.14) !important;
+        border-bottom: 1px solid var(--utility-divider) !important;
+        background: rgba(25,29,36,0.94) !important;
+        position: sticky !important;
+        top: 0 !important;
+        z-index: 2 !important;
     }
-    .utility-title { color: #F8FAFC !important; font-size: 16px !important; font-weight: 600 !important; }
+    #utility-drawer .utility-title,
+    #utility-drawer .utility-title .prose,
+    #utility-drawer .utility-title p {
+        color: var(--utility-text) !important;
+        font-size: 15px !important;
+        font-weight: 650 !important;
+        line-height: 1.3 !important;
+        margin: 0 !important;
+    }
     .drawer-close {
-        min-width: 40px !important;
-        min-height: 40px !important;
-        width: 40px !important;
-        height: 40px !important;
-        padding: 0 !important;
-        border-radius: 10px !important;
-        color: #94A3B8 !important;
-        background: rgba(51,65,85,0.32) !important;
-        border: 1px solid rgba(148,163,184,0.12) !important;
+        min-width: 52px !important;
+        min-height: 44px !important;
+        width: 52px !important;
+        height: 44px !important;
+        padding: 0 10px !important;
+        border-radius: 9px !important;
+        color: var(--utility-body) !important;
+        background: var(--utility-surface-strong) !important;
+        border: 1px solid var(--utility-border) !important;
+        white-space: nowrap !important;
     }
-    .utility-view { padding: 14px 18px 18px !important; }
-    .utility-view h3, .utility-view h4 { color: #E2E8F0 !important; margin: 4px 0 10px !important; }
-    .utility-help { color: #94A3B8 !important; font-size: 12px !important; line-height: 1.55 !important; }
-    .utility-status { color: #CBD5E1 !important; font-size: 12px !important; line-height: 1.5 !important; }
+    .drawer-close:hover {
+        color: var(--utility-text) !important;
+        background: rgba(255,255,255,0.10) !important;
+        border-color: rgba(169,205,175,0.34) !important;
+    }
+    .utility-view { padding: 18px !important; gap: 14px !important; }
+    #utility-drawer .utility-view .prose,
+    #utility-drawer .utility-view .prose * { color: var(--utility-body) !important; }
+    #utility-drawer .utility-view h3,
+    #utility-drawer .utility-view h4 {
+        color: var(--utility-text) !important;
+        font-size: 16px !important;
+        font-weight: 650 !important;
+        line-height: 1.35 !important;
+        margin: 0 0 4px !important;
+    }
+    #utility-drawer .utility-help,
+    #utility-drawer .utility-help .prose,
+    #utility-drawer .utility-help p {
+        color: var(--utility-muted) !important;
+        font-size: 13px !important;
+        line-height: 1.65 !important;
+        margin: 0 !important;
+    }
+    #utility-drawer .utility-status,
+    #utility-drawer .utility-status .prose,
+    #utility-drawer .utility-status p {
+        color: var(--utility-body) !important;
+        font-size: 13px !important;
+        line-height: 1.55 !important;
+        margin: 0 !important;
+    }
     .settings-card, .service-status-card {
-        padding: 10px 12px !important;
-        border: 1px solid rgba(148,163,184,0.13) !important;
+        padding: 10px 14px !important;
+        border: 1px solid var(--utility-border) !important;
         border-radius: 12px !important;
-        background: rgba(15,23,42,0.46) !important;
+        background: var(--utility-surface) !important;
     }
     .settings-row, .service-status-row {
         display: flex !important;
         align-items: center !important;
         justify-content: space-between !important;
         gap: 14px !important;
-        min-height: 30px !important;
-        color: #94A3B8 !important;
-        font-size: 12px !important;
-        border-bottom: 1px solid rgba(148,163,184,0.08) !important;
+        min-height: 34px !important;
+        color: var(--utility-muted) !important;
+        font-size: 13px !important;
+        border-bottom: 1px solid var(--utility-divider) !important;
     }
     .settings-row:last-child, .service-status-row:last-child { border-bottom: none !important; }
-    .settings-row strong, .service-status-row strong { color: #E2E8F0 !important; font-weight: 500 !important; text-align: right !important; }
-    .settings-reference-text { padding-top: 10px !important; color: #94A3B8 !important; font-size: 12px !important; }
-    .settings-reference-text p { color: #CBD5E1 !important; line-height: 1.55 !important; margin: 6px 0 0 !important; word-break: break-word !important; }
-    .utility-drawer .secondary, .utility-drawer button { min-height: 40px !important; }
-    .utility-drawer .primary { background: linear-gradient(135deg, #7C3AED, #6366F1) !important; border: none !important; }
-    .utility-log { min-height: 260px !important; max-height: 420px !important; }
-    .utility-log textarea, .utility-log pre {
+    .settings-row strong, .service-status-row strong {
+        color: var(--utility-text) !important;
+        font-weight: 550 !important;
+        text-align: right !important;
+    }
+    .settings-reference-text {
+        padding-top: 12px !important;
+        color: var(--utility-muted) !important;
+        font-size: 13px !important;
+    }
+    .settings-reference-text p {
+        color: var(--utility-body) !important;
+        line-height: 1.6 !important;
+        margin: 7px 0 0 !important;
+        word-break: break-word !important;
+    }
+
+    /* Gradio field internals must inherit the drawer's dark theme. */
+    #utility-drawer .utility-field,
+    #utility-drawer .utility-field > .wrap,
+    #utility-drawer .utility-field .wrap,
+    #utility-drawer .utility-field .container,
+    #utility-drawer .utility-field .input-container {
+        color: var(--utility-body) !important;
+        background: var(--utility-surface) !important;
+        border-color: var(--utility-border) !important;
+        box-shadow: none !important;
+    }
+    #utility-drawer label,
+    #utility-drawer .block-label,
+    #utility-drawer .label-wrap,
+    #utility-drawer .label-wrap span {
+        color: var(--utility-body) !important;
+        font-size: 13px !important;
+        font-weight: 550 !important;
+    }
+    #utility-drawer .block-label {
+        color: var(--utility-accent) !important;
+        background: rgba(169,205,175,0.10) !important;
+        border: 1px solid rgba(169,205,175,0.16) !important;
+        border-radius: 6px !important;
+    }
+    #utility-drawer .utility-field .container > span {
+        color: var(--utility-accent) !important;
+        background: rgba(169,205,175,0.10) !important;
+        border: 1px solid rgba(169,205,175,0.16) !important;
+        border-radius: 6px !important;
+    }
+    #utility-drawer .utility-field textarea,
+    #utility-drawer .utility-field input,
+    #utility-drawer .utility-field select {
+        min-height: 44px !important;
+        color: var(--utility-text) !important;
+        caret-color: var(--utility-accent) !important;
+        background: rgba(10,13,17,0.56) !important;
+        border: 1px solid var(--utility-border) !important;
+        border-radius: 9px !important;
+        box-shadow: none !important;
+    }
+    #utility-drawer .utility-field textarea::placeholder,
+    #utility-drawer .utility-field input::placeholder { color: #87919C !important; }
+    #utility-drawer .utility-select input { cursor: pointer !important; }
+    #utility-drawer .utility-upload {
+        min-height: 146px !important;
+        border: 1px dashed rgba(169,205,175,0.28) !important;
+        border-radius: 11px !important;
+        background: rgba(10,13,17,0.38) !important;
+        overflow: hidden !important;
+    }
+    #utility-drawer .utility-upload button {
+        color: var(--utility-accent) !important;
+        background: transparent !important;
+        border: none !important;
+    }
+    #utility-drawer button {
+        min-height: 44px !important;
+        color: var(--utility-body) !important;
+        background: var(--utility-surface-strong) !important;
+        border: 1px solid var(--utility-border) !important;
+        border-radius: 9px !important;
+        cursor: pointer !important;
+        box-shadow: none !important;
+        transition: color 180ms ease-out, background 180ms ease-out,
+            border-color 180ms ease-out !important;
+    }
+    #utility-drawer button:hover {
+        color: var(--utility-text) !important;
+        background: rgba(255,255,255,0.10) !important;
+        border-color: rgba(169,205,175,0.34) !important;
+    }
+    #utility-drawer .primary,
+    #utility-drawer .utility-apply {
+        color: #F4FAF5 !important;
+        background: var(--utility-accent-bg) !important;
+        border: 1px solid rgba(169,205,175,0.34) !important;
+        font-weight: 650 !important;
+    }
+    #utility-drawer .primary:hover,
+    #utility-drawer .utility-apply:hover { background: rgba(103,145,111,0.46) !important; }
+    #utility-drawer .utility-controls { align-items: end !important; gap: 10px !important; }
+    #utility-drawer .utility-log {
+        min-height: 280px !important;
+        max-height: 440px !important;
+        padding: 0 !important;
+        overflow: hidden !important;
+    }
+    #utility-drawer .utility-log textarea {
+        min-height: 280px !important;
+        max-height: 440px !important;
+        resize: none !important;
         font-family: 'JetBrains Mono', 'Cascadia Mono', monospace !important;
-        font-size: 11px !important;
-        line-height: 1.55 !important;
-        color: #CBD5E1 !important;
-        background: rgba(2,6,23,0.72) !important;
+        font-size: 12px !important;
+        line-height: 1.6 !important;
+        color: #D7DEE5 !important;
+        background: rgba(8,11,15,0.78) !important;
+        border: 1px solid var(--utility-border) !important;
+        padding: 12px !important;
+        white-space: pre !important;
     }
     .overall-status {
         display: inline-block !important;
-        color: #94A3B8 !important;
-        font-size: 11px !important;
+        color: var(--utility-muted) !important;
+        font-size: 13px !important;
         line-height: 1.5 !important;
         margin: 4px 0 0 !important;
     }
-    .overall-status.ready { color: #86EFAC !important; }
+    .overall-status.ready { color: #9EE6AE !important; }
     .overall-status.degraded { color: #FCD34D !important; }
 
     /* ── Custom scrollbar ──────────────────────────────────────────────────── */
@@ -2535,10 +2704,12 @@ def create_ui():
                 )
                 ref_audio_upload = gr.Audio(
                     sources=["upload"], type="filepath", label="参考音频",
+                    elem_classes=["utility-field", "utility-upload"],
                 )
                 reference_text_input = gr.Textbox(
                     value=ACTIVE_REF_TEXT, label="参考文本",
                     lines=3, max_lines=5,
+                    elem_classes=["utility-field", "utility-textarea"],
                 )
                 apply_settings_btn = gr.Button(
                     "应用设置", variant="primary", elem_classes=["utility-apply"],
@@ -2547,23 +2718,30 @@ def create_ui():
 
             with gr.Column(visible=False, elem_classes=["utility-view"]) as logs_view:
                 gr.Markdown("### 最近日志")
-                with gr.Row():
+                with gr.Row(elem_classes=["utility-controls"]):
                     logs_source = gr.Dropdown(
                         choices=["全部", "应用", "VoxCPM", "数字人", "桥接"],
                         value="全部", label="服务", scale=2,
+                        elem_classes=["utility-field", "utility-select"],
                     )
-                    logs_refresh_btn = gr.Button("刷新", scale=0, min_width=72)
-                logs_output = gr.Code(
-                    value="点击刷新查看最近日志。", language="shell",
-                    lines=18, interactive=False, show_label=False,
-                    elem_classes=["utility-log"],
+                    logs_refresh_btn = gr.Button(
+                        "刷新", scale=0, min_width=72,
+                        elem_classes=["utility-secondary-action"],
+                    )
+                logs_output = gr.Textbox(
+                    value="点击刷新查看最近日志。",
+                    lines=18, max_lines=24, interactive=False, show_label=False,
+                    elem_classes=["utility-field", "utility-log"],
                 )
 
             with gr.Column(visible=False, elem_classes=["utility-view"]) as status_view:
                 gr.Markdown("### 服务状态")
                 status_summary = gr.HTML('<div class="utility-status">点击刷新获取状态。</div>')
                 status_details = gr.HTML('<div class="utility-status">尚未检测。</div>')
-                status_refresh_btn = gr.Button("刷新状态", variant="secondary")
+                status_refresh_btn = gr.Button(
+                    "刷新状态", variant="secondary",
+                    elem_classes=["utility-secondary-action"],
+                )
 
         # ---- 浮动音频播放条（自动播放TTS语音） ----
         tts_audio_output = gr.Audio(
