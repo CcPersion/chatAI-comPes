@@ -85,6 +85,17 @@ VOXCPM_LOCAL_FILES_ONLY: true
 # LiveTalking 数字人口型驱动
 # ---------------------------------------------------------------------------
 LIVETALKING_URL: "http://localhost:8010"
+AVATAR_OUTPUT_SAMPLE_RATE: 16000
+AVATAR_FRAME_MS: 20
+AVATAR_PREBUFFER_MS: 1200
+AVATAR_REBUFFER_MS: 400
+AVATAR_MAX_BUFFER_MS: 6000
+AVATAR_AUDIO_GAIN: 1.0
+AVATAR_FADE_IN_MS: 30
+# VoxCPM remains 48 kHz. The app performs one stateful 48 kHz -> 16 kHz
+# conversion, buffers 1.2 s, then feeds LiveTalking on an exact 20 ms clock.
+# This value reflects the measured VoxCPM2 generation jitter on the RTX 5060 Ti.
+# Lowering it reduces latency but makes sentence-boundary stalls more likely.
 # LiveTalking 服务地址（WSL2 内）。
 # 口型驱动与 WebRTC 推送的目标。
 

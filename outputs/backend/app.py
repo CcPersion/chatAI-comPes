@@ -27,6 +27,7 @@ import queue
 import traceback
 import re
 import inspect
+import atexit
 from pathlib import Path
 from datetime import datetime
 from io import BytesIO
@@ -40,8 +41,10 @@ import numpy as np
 
 try:
     from outputs.backend.voxcpm_client import VoxCPMClient
+    from outputs.backend.audio_playout import LiveTalkingAudioPlayout
 except ImportError:  # direct ``python outputs/backend/app.py`` execution
     from voxcpm_client import VoxCPMClient
+    from audio_playout import LiveTalkingAudioPlayout
 
 # ---- 日志配置 ----
 logging.basicConfig(
@@ -134,6 +137,13 @@ VOXCPM_SAMPLE_RATE = int(config.get("VOXCPM_SAMPLE_RATE", 48000))
 VOXCPM_WORKER_URL = str(config.get("VOXCPM_WORKER_URL", "http://127.0.0.1:8020")).rstrip("/")
 VOXCPM_LOCAL_FILES_ONLY = bool(config.get("VOXCPM_LOCAL_FILES_ONLY", True))
 LIVETALKING_URL = str(config.get("LIVETALKING_URL", "http://localhost:8010"))
+AVATAR_OUTPUT_SAMPLE_RATE = int(config.get("AVATAR_OUTPUT_SAMPLE_RATE", 16000))
+AVATAR_FRAME_MS = int(config.get("AVATAR_FRAME_MS", 20))
+AVATAR_PREBUFFER_MS = int(config.get("AVATAR_PREBUFFER_MS", 1200))
+AVATAR_REBUFFER_MS = int(config.get("AVATAR_REBUFFER_MS", 400))
+AVATAR_MAX_BUFFER_MS = int(config.get("AVATAR_MAX_BUFFER_MS", 6000))
+AVATAR_AUDIO_GAIN = float(config.get("AVATAR_AUDIO_GAIN", 1.0))
+AVATAR_FADE_IN_MS = int(config.get("AVATAR_FADE_IN_MS", 30))
 AVATAR_SYNC_URL = str(config.get("AVATAR_SYNC_URL", "http://localhost:8011"))
 UPLOAD_DIR = os.path.expanduser(str(config.get("UPLOAD_DIR", "~/setup/uploads")))
 MAX_UPLOAD_SIZE_MB = int(config.get("MAX_UPLOAD_SIZE_MB", 15))
@@ -640,6 +650,44 @@ def pop_tts_units(buffer: str, final: bool = False) -> Tuple[list, str]:
         units.append(remaining.strip())
         remaining = ""
     return units, remaining
+
+
+def batch_tts_reply(text: str, max_chars: int = 160) -> List[str]:
+    """Build large semantic TTS batches without restarting VoxCPM per sentence.
+
+    LLM tokens are still shown immediately.  Once the short local-model reply
+    is complete, ordinary replies use one VoxCPM streaming generation.  Only a
+    genuinely long answer is split, and then at sentence boundaries so the
+    playout buffer has ample audio to cover the next generation startup.
+    """
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+    sentences = [
+        part.strip()
+        for part in re.findall(r".+?[。！？；.!?;\n]+|.+$", cleaned, re.S)
+        if part.strip()
+    ]
+    batches: List[str] = []
+    current = ""
+    for sentence in sentences:
+        if current and len(current) + len(sentence) > max_chars:
+            batches.append(current)
+            current = ""
+        if len(sentence) <= max_chars:
+            current += sentence
+            continue
+        if current:
+            batches.append(current)
+            current = ""
+        # Pathological punctuation-free answers still remain bounded.
+        batches.extend(
+            sentence[offset : offset + max_chars]
+            for offset in range(0, len(sentence), max_chars)
+        )
+    if current:
+        batches.append(current)
+    return batches
 
 
 def normalize_tts_text(text: str) -> str:
@@ -1232,103 +1280,6 @@ def forward_text_to_livetalking(text: str, session_id: str = "0") -> bool:
         return False
 
 
-class LiveTalkingAudioStream:
-    """持续向 LiveTalking 推送原始 PCM，不为每个 TTS 片段建立 HTTP 请求。"""
-
-    def __init__(self, base_url: str, session_id: str = "0", sample_rate: int = 48000):
-        self.url = f"{base_url.rstrip('/')}/humanaudio/stream"
-        self.session_id = session_id
-        self.sample_rate = int(sample_rate)
-        self._queue: queue.Queue[Optional[bytes]] = queue.Queue(maxsize=250)
-        self._closed = threading.Event()
-        self._failed = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run, name="livetalking-audio-stream", daemon=True
-        )
-        self._thread.start()
-
-    def _body(self):
-        while True:
-            payload = self._queue.get()
-            if payload is None:
-                return
-            yield payload
-
-    def _run(self):
-        try:
-            response = requests.post(
-                self.url,
-                params={"sessionid": self.session_id},
-                headers={
-                    "Content-Type": "application/octet-stream",
-                    "X-Audio-Sample-Rate": str(self.sample_rate),
-                    "X-Audio-Format": "pcm_s16le_mono",
-                },
-                data=self._body(),
-                timeout=(5.0, None),
-            )
-            try:
-                result = response.json()
-            except ValueError:
-                result = {"code": response.status_code, "msg": response.text[:200]}
-            if response.status_code != 200 or result.get("code", 0) != 0:
-                self._failed.set()
-                logger.warning(
-                    "口型驱动: 持续音频流失败 HTTP %s: %s",
-                    response.status_code,
-                    result,
-                )
-            else:
-                logger.info("口型驱动: 持续音频流结束 -> %s", result)
-        except requests.ConnectionError:
-            self._failed.set()
-            logger.warning("口型驱动: LiveTalking 持续音频流不可达")
-        except Exception:
-            self._failed.set()
-            logger.error("口型驱动: 持续音频流异常 - %s", traceback.format_exc())
-        finally:
-            self._closed.set()
-
-    def push(self, audio_data: np.ndarray) -> bool:
-        if self._closed.is_set() or self._failed.is_set():
-            return False
-        raw = np.asarray(audio_data).reshape(-1)
-        if not raw.size:
-            return True
-        if np.issubdtype(raw.dtype, np.integer):
-            audio_f32 = raw.astype(np.float32) / 32767.0
-        else:
-            audio_f32 = raw.astype(np.float32)
-        audio_f32 = np.clip(audio_f32, -1.0, 1.0)
-
-        # Keep the existing mouth-driving level while preserving a continuous
-        # stream. The limiter prevents one loud model chunk from clipping.
-        rms = float(np.sqrt(np.mean(audio_f32.astype(np.float64) ** 2)))
-        peak = float(np.max(np.abs(audio_f32)))
-        if rms < 0.008:
-            gain = 1.0
-        else:
-            gain = min(0.316 / rms, 0.95 / max(peak, 1e-6), 4.0)
-        # LiveTalking expects signed 16-bit PCM. Keep the normalized float
-        # signal until the final conversion, then scale it to int16 range.
-        pcm = (np.clip(audio_f32 * gain, -1.0, 1.0) * 32767.0).astype("<i2")
-        try:
-            self._queue.put(pcm.tobytes(), timeout=2.0)
-            return True
-        except queue.Full:
-            logger.warning("口型驱动: 持续音频流队列阻塞，丢弃当前片段")
-            return False
-
-    def close(self):
-        if self._closed.is_set():
-            return
-        try:
-            self._queue.put(None, timeout=2.0)
-        except queue.Full:
-            logger.warning("口型驱动: 持续音频流关闭超时")
-        self._thread.join(timeout=5.0)
-
-
 # =============================================================================
 # 核心对话管线
 # =============================================================================
@@ -1341,20 +1292,47 @@ class ConversationPipeline:
         self.history: List[dict] = [
             {"role": "system", "content": "你是一个友善、体贴的AI语音助手，说话温柔自然，用中文回复。回复自然、有陪伴感、口语化，适合语音朗读；根据用户需要决定回复长度，不要为了语音合成而刻意缩短内容。"}
         ]
-        self._avatar_stream: Optional[LiveTalkingAudioStream] = None
+        self._avatar_stream: Optional[LiveTalkingAudioPlayout] = None
         self._avatar_stream_lock = threading.Lock()
 
     def _push_avatar_audio(self, audio_data: np.ndarray, sample_rate: int) -> bool:
-        """把每个 VoxCPM 音频片段直接写入持久 LiveTalking 音频流。"""
+        """把 VoxCPM 音频交给固定时钟的持久 LiveTalking 播放器。"""
         with self._avatar_stream_lock:
-            if self._avatar_stream is None:
-                self._avatar_stream = LiveTalkingAudioStream(
-                    LIVETALKING_URL, "0", int(sample_rate)
+            if self._avatar_stream is None or self._avatar_stream.failed:
+                old_stream = self._avatar_stream
+                self._avatar_stream = LiveTalkingAudioPlayout(
+                    LIVETALKING_URL,
+                    "0",
+                    output_rate=AVATAR_OUTPUT_SAMPLE_RATE,
+                    frame_ms=AVATAR_FRAME_MS,
+                    prebuffer_ms=AVATAR_PREBUFFER_MS,
+                    rebuffer_ms=AVATAR_REBUFFER_MS,
+                    max_buffer_ms=AVATAR_MAX_BUFFER_MS,
+                    gain=AVATAR_AUDIO_GAIN,
+                    fade_in_ms=AVATAR_FADE_IN_MS,
                 )
+                if old_stream is not None:
+                    old_stream.close()
             stream = self._avatar_stream
-        return stream.push(audio_data)
+        return stream.push(audio_data, int(sample_rate))
+
+    def _finish_avatar_audio_stream(self, wait: bool = False):
+        """结束本轮话语，但保留跨轮复用的 LiveTalking HTTP 连接。"""
+        with self._avatar_stream_lock:
+            stream = self._avatar_stream
+        if stream is not None:
+            stream.finish_utterance()
+            if wait and not stream.wait_until_idle(timeout=60.0):
+                logger.warning("口型驱动: 等待播放队列清空超时")
+
+    def _interrupt_avatar_audio_stream(self):
+        with self._avatar_stream_lock:
+            stream = self._avatar_stream
+        if stream is not None:
+            stream.interrupt()
 
     def _close_avatar_audio_stream(self):
+        """只在应用退出时真正关闭 LiveTalking HTTP 连接。"""
         with self._avatar_stream_lock:
             stream = self._avatar_stream
             self._avatar_stream = None
@@ -1391,6 +1369,7 @@ class ConversationPipeline:
         try:
             user_text = _get_asr().transcribe(audio_data, sample_rate)
         except PipelineError as e:
+            self._finish_avatar_audio_stream()
             state_machine.transition(AvatarState.IDLE)
             yield {"type": "error", "error": e.to_dict()["error"]}
             return
@@ -1407,35 +1386,25 @@ class ConversationPipeline:
 
         cancel = state_machine.cancel_event
 
-        # VoxCPM is the only active TTS route. Keep LLM units short enough for
-        # the worker's streaming endpoint to return audio while more text is
-        # still arriving.
+        # Stream LLM text to the UI first, then use one VoxCPM streaming
+        # generation for a normal reply. Restarting VoxCPM for every sentence
+        # creates a measurable gap on the RTX 5060 Ti.
         full_reply = ""
-        tts_pending = ""
         try:
             for token in llm_client.stream_chat(self.history, cancel):
                 if cancel.is_set():
                     break
                 full_reply += token
                 yield {"type": "reply_token", "text": token}
-                tts_pending += token
-                tts_units, tts_pending = pop_tts_units(tts_pending)
-                for sentence in tts_units:
+            if full_reply.strip() and not cancel.is_set():
+                for speech_batch in batch_tts_reply(full_reply):
                     if cancel.is_set():
                         break
                     yield from self._synthesize_and_dispatch(
-                        sentence, session_id, cancel
-                    )
-
-            if tts_pending.strip() and not cancel.is_set():
-                speech_units, tts_pending = pop_tts_units(tts_pending, final=True)
-                for sentence in speech_units:
-                    if cancel.is_set():
-                        break
-                    yield from self._synthesize_and_dispatch(
-                        sentence, session_id, cancel
+                        speech_batch, session_id, cancel
                     )
         except PipelineError as e:
+            self._finish_avatar_audio_stream()
             state_machine.transition(AvatarState.IDLE)
             yield {"type": "error", "error": e.to_dict()["error"]}
             return
@@ -1447,8 +1416,8 @@ class ConversationPipeline:
             if len(self.history) > 41:  # 1 system + 20*2 user/assistant
                 self.history = [self.history[0]] + self.history[-40:]
 
+        self._finish_avatar_audio_stream(wait=True)
         state_machine.transition(AvatarState.IDLE)
-        self._close_avatar_audio_stream()
         yield {"type": "status", "state": "idle", "text": "待机"}
 
     def process_text(self, text: str) -> Generator[dict, None, None]:
@@ -1464,38 +1433,33 @@ class ConversationPipeline:
 
         cancel = state_machine.cancel_event
         full_reply = ""
-        tts_pending = ""
         try:
             for token in llm_client.stream_chat(self.history, cancel):
                 if cancel.is_set():
                     break
                 full_reply += token
                 yield {"type": "reply_token", "text": token}
-                tts_pending += token
-                tts_units, tts_pending = pop_tts_units(tts_pending)
-                for sentence in tts_units:
-                    if cancel.is_set():
-                        break
-                    yield from self._synthesize_and_dispatch(sentence, session_id, cancel)
         except PipelineError as e:
+            self._finish_avatar_audio_stream()
             state_machine.transition(AvatarState.IDLE)
             yield {"type": "error", "error": e.to_dict()["error"]}
             return
 
         if full_reply.strip() and not cancel.is_set():
-            speech_units, _ = pop_tts_units(tts_pending, final=True)
-            for sentence in speech_units:
+            for speech_batch in batch_tts_reply(full_reply):
                 if cancel.is_set():
                     break
-                yield from self._synthesize_and_dispatch(sentence, session_id, cancel)
+                yield from self._synthesize_and_dispatch(
+                    speech_batch, session_id, cancel
+                )
 
         if not cancel.is_set():
             self.history.append({"role": "assistant", "content": full_reply})
             if len(self.history) > 41:
                 self.history = [self.history[0]] + self.history[-40:]
 
+        self._finish_avatar_audio_stream(wait=True)
         state_machine.transition(AvatarState.IDLE)
-        self._close_avatar_audio_stream()
         yield {"type": "status", "state": "idle", "text": "待机"}
 
     def _synthesize_and_dispatch(self, text: str, session_id: str,
@@ -1641,8 +1605,12 @@ class ConversationPipeline:
     def stop(self):
         """停止/打断"""
         state_machine.transition(AvatarState.IDLE)
-        self._close_avatar_audio_stream()
+        self._interrupt_avatar_audio_stream()
         logger.info("用户触发停止/打断")
+
+    def shutdown(self):
+        """应用退出时释放后台播放线程和持久 HTTP 请求。"""
+        self._close_avatar_audio_stream()
 
     def clear_history(self):
         """清除对话历史"""
@@ -1652,6 +1620,7 @@ class ConversationPipeline:
 
 # 全局管线实例
 pipeline = ConversationPipeline()
+atexit.register(pipeline.shutdown)
 
 
 # =============================================================================
@@ -2297,11 +2266,6 @@ def create_ui():
                         yield "", new_history, status, audio_skip()
                     elif event["type"] == "status":
                         status = event["text"]
-                        # The last Qwen chunk may still be playing in the browser;
-                        # keep the avatar in its speaking visual state until the
-                        # next user turn instead of clearing the audio output.
-                        if status == "待机" and progressive_audio_count:
-                            status = "播放中"
                         # Keep generator alive during TTS phase
                         yield "", new_history, status, audio_skip()
                     elif event["type"] == "error":
@@ -2405,9 +2369,7 @@ def create_ui():
                         yield chat_history, status, ""
                     elif event["type"] == "status":
                         status = event["text"]
-                        if status == "待机" and audio_count:
-                            status = "播放中"
-                            yield chat_history, status, ""
+                        yield chat_history, status, ""
                     elif event["type"] == "audio":
                         # 语音输入链路此前漏掉了 audio 事件，导致音频只
                         # 累积在管线里，直到整轮结束才尝试发送。现在每个
