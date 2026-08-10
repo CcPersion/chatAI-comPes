@@ -9,6 +9,17 @@ set -e
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MAIN_PYTHON="${MAIN_PYTHON:-$ROOT_DIR/venv/bin/python}"
 
+# WSL2 地址会在重启后变化，更新 Windows 侧本地端口转发。
+WSL_IP="$(hostname -I | awk '{print $1}')"
+NETSH_EXE="/mnt/c/Windows/System32/netsh.exe"
+if [[ -x "$NETSH_EXE" && -n "$WSL_IP" ]]; then
+  for PORT in 7860 8010 8011; do
+    "$NETSH_EXE" interface portproxy set v4tov4 \
+      listenaddress=127.0.0.1 listenport="$PORT" \
+      connectaddress="$WSL_IP" connectport="$PORT" >/dev/null 2>&1 || true
+  done
+fi
+
 if [[ ! -x "$MAIN_PYTHON" ]]; then
   echo "ERROR: main WSL Python environment is missing: $MAIN_PYTHON" >&2
   exit 2
