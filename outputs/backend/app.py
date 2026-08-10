@@ -92,9 +92,9 @@ def error_response(code: str, message: str, detail: str = "") -> dict:
 def find_config() -> str:
     """查找 voice.yaml 配置文件"""
     search_paths = [
-        os.path.expanduser("~/setup/voice.yaml"),
         os.path.join(os.path.dirname(__file__), "..", "..", "config", "voice.yaml"),
         os.path.join(os.getcwd(), "config", "voice.yaml"),
+        os.path.expanduser("~/setup/voice.yaml"),
         os.path.join(os.getcwd(), "voice.yaml"),
     ]
     for p in search_paths:
