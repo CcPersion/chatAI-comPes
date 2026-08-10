@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,6 +25,20 @@ def test_recent_logs_rejects_unknown_source_without_reading_arbitrary_path():
 
     assert "【应用】" in output
     assert "should-not-be-read" not in output
+
+
+def test_recent_logs_supports_up_to_one_thousand_lines(tmp_path, monkeypatch):
+    log_path = tmp_path / "app.log"
+    log_path.write_text(
+        "\n".join(f"line-{index}" for index in range(1200)),
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(app.LOG_SOURCE_PATHS, "应用", str(log_path))
+
+    output = app.get_recent_logs("应用", limit=1000)
+
+    assert "line-199\n" not in output
+    assert "line-200" in output and "line-1199" in output
 
 
 def test_runtime_settings_do_not_expose_model_or_service_paths():
@@ -88,3 +103,62 @@ def test_apply_reference_audio_requires_a_file():
 
     assert result["error"]["code"] == "TTS_ERR_002"
     assert "参考音频" in result["error"]["message"]
+
+
+def test_apply_runtime_settings_updates_live_objects_and_persists(monkeypatch):
+    persisted = {}
+    for key in app.EDITABLE_RUNTIME_KEYS:
+        monkeypatch.setattr(app, key, getattr(app, key))
+    monkeypatch.setattr(app, "config", dict(app.config))
+    fake_pipeline = SimpleNamespace(
+        vad=SimpleNamespace(threshold=0.0, min_silence_ms=0),
+        _close_avatar_audio_stream=lambda: persisted.update(stream_closed=True),
+    )
+    fake_tts = SimpleNamespace(style_prompt="")
+    monkeypatch.setattr(app, "pipeline", fake_pipeline)
+    monkeypatch.setattr(app, "tts_engine", fake_tts)
+    monkeypatch.setattr(app, "_persist_runtime_settings", lambda values: persisted.update(values))
+
+    values = dict(zip(app.EDITABLE_RUNTIME_KEYS, app.get_runtime_form_values()))
+    values.update(
+        LLM_TEMPERATURE=0.9,
+        VOXCPM_STYLE_PROMPT="语速稍慢，停顿自然",
+        AVATAR_AUDIO_GAIN=1.6,
+    )
+
+    result = app.apply_runtime_settings(values)
+
+    assert result["ok"] is True
+    assert app.LLM_TEMPERATURE == 0.9
+    assert app.AVATAR_AUDIO_GAIN == 1.6
+    assert fake_tts.style_prompt == "语速稍慢，停顿自然"
+    assert persisted["stream_closed"] is True
+    assert persisted["LOG_LEVEL"] == app.LOG_LEVEL
+
+
+def test_apply_runtime_settings_rejects_invalid_values(monkeypatch):
+    persisted = []
+    monkeypatch.setattr(app, "_persist_runtime_settings", lambda values: persisted.append(values))
+    values = dict(zip(app.EDITABLE_RUNTIME_KEYS, app.get_runtime_form_values()))
+    values["VAD_THRESH"] = 2.0
+
+    result = app.apply_runtime_settings(values)
+
+    assert result["error"]["code"] == "CFG_ERR_002"
+    assert persisted == []
+
+
+def test_persist_runtime_settings_preserves_comments_and_unlisted_values(tmp_path, monkeypatch):
+    config_path = tmp_path / "voice.yaml"
+    config_path.write_text(
+        "# keep this comment\nLLM_TEMPERATURE: 0.7\nLLM_MODEL: qwen-test\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app, "CONFIG_PATH", str(config_path))
+
+    app._persist_runtime_settings({"LLM_TEMPERATURE": 0.8})
+
+    saved = config_path.read_text(encoding="utf-8")
+    assert "# keep this comment" in saved
+    assert "LLM_TEMPERATURE: 0.8" in saved
+    assert "LLM_MODEL: qwen-test" in saved

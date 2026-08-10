@@ -29,6 +29,7 @@ import re
 import inspect
 import atexit
 import html
+from collections import deque
 from pathlib import Path
 from datetime import datetime
 from io import BytesIO
@@ -140,6 +141,7 @@ VOXCPM_SAMPLE_RATE = int(config.get("VOXCPM_SAMPLE_RATE", 48000))
 VOXCPM_WORKER_URL = str(config.get("VOXCPM_WORKER_URL", "http://127.0.0.1:8020")).rstrip("/")
 VOXCPM_LOCAL_FILES_ONLY = bool(config.get("VOXCPM_LOCAL_FILES_ONLY", True))
 VOXCPM_STYLE_PROMPT = str(config.get("VOXCPM_STYLE_PROMPT", "")).strip()
+TTS_BACKCHANNEL_ENABLED = bool(config.get("TTS_BACKCHANNEL_ENABLED", False))
 LIVETALKING_URL = str(config.get("LIVETALKING_URL", "http://localhost:8010"))
 AVATAR_OUTPUT_SAMPLE_RATE = int(config.get("AVATAR_OUTPUT_SAMPLE_RATE", 16000))
 AVATAR_FRAME_MS = int(config.get("AVATAR_FRAME_MS", 20))
@@ -161,6 +163,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # 读取日志配置并应用
 LOG_LEVEL = str(config.get("LOG_LEVEL", "INFO")).upper()
 LOG_DIR = os.path.expanduser(str(config.get("LOG_DIR", "~/setup/logs")))
+_config_write_lock = threading.Lock()
 
 _log_level = getattr(logging, LOG_LEVEL, logging.INFO)
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -523,7 +526,7 @@ class LLMClient:
             "max_tokens": LLM_MAX_TOKENS,
         }
         if LLM_KEEP_ALIVE:
-            payload["keep_alive"] = LLM_KEEP_ALIVE
+            payload["keep_alive"] = 0 if LLM_KEEP_ALIVE == "0" else LLM_KEEP_ALIVE
 
         try:
             with self.client.stream("POST", url, json=payload) as response:
@@ -1278,6 +1281,25 @@ def handle_audio_upload(uploaded_file, prompt_text: str = "") -> dict:
         return error_response("TTS_ERR_002", "参考音频上传处理失败", "")
 
 
+EDITABLE_RUNTIME_KEYS = (
+    "LLM_TEMPERATURE",
+    "LLM_MAX_TOKENS",
+    "LLM_KEEP_ALIVE",
+    "VAD_THRESH",
+    "MIN_SILENCE_MS",
+    "MAX_AUDIO_SEC",
+    "ASR_LANG",
+    "VOXCPM_STYLE_PROMPT",
+    "AVATAR_AUDIO_GAIN",
+    "AVATAR_PREBUFFER_MS",
+    "AVATAR_REBUFFER_MS",
+    "AVATAR_MAX_BUFFER_MS",
+    "AVATAR_FADE_IN_MS",
+    "AVATAR_LEAD_IN_MS",
+    "LOG_LEVEL",
+)
+
+
 def get_runtime_settings() -> dict:
     """Return a safe, user-facing snapshot of the current runtime settings."""
     reference_exists = bool(ACTIVE_REF_WAV and os.path.isfile(ACTIVE_REF_WAV))
@@ -1292,7 +1314,189 @@ def get_runtime_settings() -> dict:
         "reference_audio": "已配置" if reference_exists else "未配置",
         "reference_text": ACTIVE_REF_TEXT or "未设置",
         "local_files_only": "是" if VOXCPM_LOCAL_FILES_ONLY else "否",
+        "llm_temperature": LLM_TEMPERATURE,
+        "llm_max_tokens": LLM_MAX_TOKENS,
+        "llm_keep_alive": LLM_KEEP_ALIVE,
+        "vad_threshold": VAD_THRESH,
+        "min_silence_ms": MIN_SILENCE_MS,
+        "max_audio_sec": MAX_AUDIO_SEC,
+        "asr_language": ASR_LANG,
+        "rebuffer": AVATAR_REBUFFER_MS,
+        "max_buffer": AVATAR_MAX_BUFFER_MS,
+        "fade_in": AVATAR_FADE_IN_MS,
+        "lead_in": AVATAR_LEAD_IN_MS,
+        "log_level": LOG_LEVEL,
     }
+
+
+def get_runtime_form_values() -> Tuple[Any, ...]:
+    """Return editable values in the same stable order as the settings form."""
+    return (
+        LLM_TEMPERATURE,
+        LLM_MAX_TOKENS,
+        LLM_KEEP_ALIVE,
+        VAD_THRESH,
+        MIN_SILENCE_MS,
+        MAX_AUDIO_SEC,
+        ASR_LANG,
+        VOXCPM_STYLE_PROMPT,
+        AVATAR_AUDIO_GAIN,
+        AVATAR_PREBUFFER_MS,
+        AVATAR_REBUFFER_MS,
+        AVATAR_MAX_BUFFER_MS,
+        AVATAR_FADE_IN_MS,
+        AVATAR_LEAD_IN_MS,
+        LOG_LEVEL,
+    )
+
+
+def _coerce_runtime_settings(values: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate the public settings whitelist and normalize component values."""
+    unknown = set(values) - set(EDITABLE_RUNTIME_KEYS)
+    if unknown:
+        raise ValueError("包含不允许修改的设置")
+
+    normalized: Dict[str, Any] = {}
+
+    def number(key: str, minimum: float, maximum: float, *, integer: bool = False):
+        raw = values.get(key)
+        try:
+            value = int(raw) if integer else float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} 必须是数字") from exc
+        if value < minimum or value > maximum:
+            raise ValueError(f"{key} 必须在 {minimum:g}–{maximum:g} 之间")
+        normalized[key] = value
+
+    number("LLM_TEMPERATURE", 0.0, 1.5)
+    number("LLM_MAX_TOKENS", 128, 4096, integer=True)
+    number("VAD_THRESH", 0.1, 0.9)
+    number("MIN_SILENCE_MS", 300, 1500, integer=True)
+    number("MAX_AUDIO_SEC", 5, 60, integer=True)
+    number("AVATAR_AUDIO_GAIN", 0.5, 2.5)
+    number("AVATAR_PREBUFFER_MS", 400, 2500, integer=True)
+    number("AVATAR_REBUFFER_MS", 100, 1200, integer=True)
+    number("AVATAR_MAX_BUFFER_MS", 2000, 12000, integer=True)
+    number("AVATAR_FADE_IN_MS", 0, 200, integer=True)
+    number("AVATAR_LEAD_IN_MS", 0, 500, integer=True)
+
+    if normalized["AVATAR_REBUFFER_MS"] > normalized["AVATAR_PREBUFFER_MS"]:
+        raise ValueError("重新缓冲不能大于首段预缓冲")
+    if normalized["AVATAR_MAX_BUFFER_MS"] <= normalized["AVATAR_PREBUFFER_MS"]:
+        raise ValueError("最大缓冲必须大于首段预缓冲")
+
+    keep_alive = str(values.get("LLM_KEEP_ALIVE", "")).strip().lower()
+    if not re.fullmatch(r"(?:0|[1-9]\d*[smhd])", keep_alive):
+        raise ValueError("模型驻留时间请使用 30m、2h、24h 或 0 这类格式")
+    normalized["LLM_KEEP_ALIVE"] = keep_alive
+
+    language = str(values.get("ASR_LANG", "")).strip().lower()
+    if not re.fullmatch(r"[a-z]{2,3}", language):
+        raise ValueError("识别语言请使用 zh、en、ja 等语言代码")
+    normalized["ASR_LANG"] = language
+
+    style_prompt = str(values.get("VOXCPM_STYLE_PROMPT", "")).strip()
+    if len(style_prompt) > 80:
+        raise ValueError("语音风格最多 80 个字符")
+    normalized["VOXCPM_STYLE_PROMPT"] = style_prompt
+
+    log_level = str(values.get("LOG_LEVEL", "INFO")).strip().upper()
+    if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
+        raise ValueError("日志级别不受支持")
+    normalized["LOG_LEVEL"] = log_level
+    return normalized
+
+
+def _yaml_scalar(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _persist_runtime_settings(values: Dict[str, Any]) -> None:
+    """Atomically update only whitelisted scalar keys while preserving comments."""
+    config_path = Path(CONFIG_PATH)
+    with _config_write_lock:
+        original = config_path.read_text(encoding="utf-8")
+        updated = original
+        for key, value in values.items():
+            if key not in EDITABLE_RUNTIME_KEYS:
+                raise ValueError("拒绝写入非白名单设置")
+            replacement = f"{key}: {_yaml_scalar(value)}"
+            pattern = re.compile(rf"(?m)^{re.escape(key)}\s*:\s*[^\r\n]*$")
+            if pattern.search(updated):
+                updated = pattern.sub(replacement, updated, count=1)
+            else:
+                updated = updated.rstrip() + f"\n{replacement}\n"
+
+        temp_path = config_path.with_name(config_path.name + ".runtime.tmp")
+        try:
+            temp_path.write_text(updated, encoding="utf-8")
+            try:
+                os.chmod(temp_path, config_path.stat().st_mode)
+            except OSError:
+                pass
+            os.replace(temp_path, config_path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+
+
+def apply_runtime_settings(values: Dict[str, Any]) -> dict:
+    """Apply validated runtime settings now and persist them for the next start."""
+    global LLM_TEMPERATURE, LLM_MAX_TOKENS, LLM_KEEP_ALIVE
+    global VAD_THRESH, MIN_SILENCE_MS, MAX_AUDIO_SEC, ASR_LANG
+    global VOXCPM_STYLE_PROMPT, AVATAR_AUDIO_GAIN, AVATAR_PREBUFFER_MS
+    global AVATAR_REBUFFER_MS, AVATAR_MAX_BUFFER_MS, AVATAR_FADE_IN_MS
+    global AVATAR_LEAD_IN_MS, LOG_LEVEL, config
+
+    if state_machine.state is not AvatarState.IDLE:
+        return error_response("CFG_ERR_003", "请等待当前回复结束或先点击停止")
+    try:
+        normalized = _coerce_runtime_settings(values)
+        _persist_runtime_settings(normalized)
+    except (OSError, ValueError) as exc:
+        return error_response("CFG_ERR_002", str(exc))
+
+    avatar_changed = any(
+        normalized[key] != globals()[key]
+        for key in (
+            "AVATAR_AUDIO_GAIN", "AVATAR_PREBUFFER_MS", "AVATAR_REBUFFER_MS",
+            "AVATAR_MAX_BUFFER_MS", "AVATAR_FADE_IN_MS", "AVATAR_LEAD_IN_MS",
+        )
+    )
+    LLM_TEMPERATURE = normalized["LLM_TEMPERATURE"]
+    LLM_MAX_TOKENS = normalized["LLM_MAX_TOKENS"]
+    LLM_KEEP_ALIVE = normalized["LLM_KEEP_ALIVE"]
+    VAD_THRESH = normalized["VAD_THRESH"]
+    MIN_SILENCE_MS = normalized["MIN_SILENCE_MS"]
+    MAX_AUDIO_SEC = normalized["MAX_AUDIO_SEC"]
+    ASR_LANG = normalized["ASR_LANG"]
+    VOXCPM_STYLE_PROMPT = normalized["VOXCPM_STYLE_PROMPT"]
+    AVATAR_AUDIO_GAIN = normalized["AVATAR_AUDIO_GAIN"]
+    AVATAR_PREBUFFER_MS = normalized["AVATAR_PREBUFFER_MS"]
+    AVATAR_REBUFFER_MS = normalized["AVATAR_REBUFFER_MS"]
+    AVATAR_MAX_BUFFER_MS = normalized["AVATAR_MAX_BUFFER_MS"]
+    AVATAR_FADE_IN_MS = normalized["AVATAR_FADE_IN_MS"]
+    AVATAR_LEAD_IN_MS = normalized["AVATAR_LEAD_IN_MS"]
+    LOG_LEVEL = normalized["LOG_LEVEL"]
+    config.update(normalized)
+
+    active_pipeline = globals().get("pipeline")
+    if active_pipeline is not None:
+        active_pipeline.vad.threshold = VAD_THRESH
+        active_pipeline.vad.min_silence_ms = MIN_SILENCE_MS
+        if avatar_changed:
+            active_pipeline._close_avatar_audio_stream()
+    active_tts = globals().get("tts_engine")
+    if active_tts is not None:
+        active_tts.style_prompt = VOXCPM_STYLE_PROMPT.strip().strip("()（）")
+    logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+    logger.info("运行设置已应用: %s", ", ".join(normalized.keys()))
+    return {"ok": True, "message": "运行设置已保存，将从下一轮回复开始生效"}
 
 
 def render_runtime_settings(settings: Optional[dict] = None) -> str:
@@ -1333,7 +1537,7 @@ def apply_reference_audio(file_path: Optional[str], prompt_text: str = "") -> di
 def get_recent_logs(source: str = "全部", limit: int = 200) -> str:
     """Read only allow-listed local service logs, capped to the latest lines."""
     try:
-        line_limit = max(1, min(int(limit), 200))
+        line_limit = max(1, min(int(limit), 1000))
     except (TypeError, ValueError):
         line_limit = 200
     if source not in LOG_SOURCE_LABELS:
@@ -1346,8 +1550,9 @@ def get_recent_logs(source: str = "全部", limit: int = 200) -> str:
             if not path.is_file():
                 content = "暂无日志"
             else:
-                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-                content = "\n".join(lines[-line_limit:]) or "暂无日志"
+                with path.open("r", encoding="utf-8", errors="replace") as stream:
+                    lines = deque((line.rstrip("\r\n") for line in stream), maxlen=line_limit)
+                content = "\n".join(lines) or "暂无日志"
         except OSError:
             content = "日志暂时不可读取"
         blocks.append(f"【{label}】\n{content}")
@@ -1530,6 +1735,11 @@ class ConversationPipeline:
         # ---- ASR 转写 ----
         state_machine.transition(AvatarState.THINKING)
         yield {"type": "status", "state": "thinking", "text": "正在识别..."}
+
+        max_samples = max(1, int(sample_rate * MAX_AUDIO_SEC))
+        if audio_data is not None and len(audio_data) > max_samples:
+            logger.info("录音超过 %s 秒，已按设置截取", MAX_AUDIO_SEC)
+            audio_data = audio_data[:max_samples]
 
         if _get_asr() is None:
             state_machine.transition(AvatarState.IDLE)
@@ -2261,6 +2471,15 @@ def create_ui():
         scrollbar-color: rgba(169,205,175,0.38) transparent !important;
         scrollbar-width: thin !important;
     }
+    #utility-drawer[data-panel="settings"] {
+        width: min(590px, calc(100vw - 40px)) !important;
+    }
+    #utility-drawer[data-panel="logs"] {
+        width: min(720px, calc(100vw - 40px)) !important;
+    }
+    #utility-drawer[data-panel="status"] {
+        width: min(390px, calc(100vw - 40px)) !important;
+    }
     @keyframes utility-drawer-in {
         from { opacity: 0; transform: translateY(8px); }
         to { opacity: 1; transform: translateY(0); }
@@ -2288,7 +2507,7 @@ def create_ui():
         justify-content: space-between !important;
         padding: 16px 18px 12px !important;
         border-bottom: 1px solid var(--utility-divider) !important;
-        background: rgba(25,29,36,0.94) !important;
+        background: #191D24 !important;
         position: sticky !important;
         top: 0 !important;
         z-index: 2 !important;
@@ -2463,24 +2682,63 @@ def create_ui():
     #utility-drawer .primary:hover,
     #utility-drawer .utility-apply:hover { background: rgba(103,145,111,0.46) !important; }
     #utility-drawer .utility-controls { align-items: end !important; gap: 10px !important; }
+    #utility-drawer .utility-form-grid {
+        align-items: start !important;
+        gap: 12px !important;
+    }
+    #utility-drawer .utility-accordion {
+        border: 1px solid var(--utility-border) !important;
+        border-radius: 11px !important;
+        background: var(--utility-surface) !important;
+        overflow: hidden !important;
+    }
+    #utility-drawer .utility-accordion > button,
+    #utility-drawer .utility-accordion summary {
+        min-height: 46px !important;
+        color: var(--utility-text) !important;
+        background: rgba(255,255,255,0.025) !important;
+        border: none !important;
+        border-radius: 0 !important;
+        font-size: 14px !important;
+        font-weight: 650 !important;
+    }
+    #utility-drawer .utility-accordion > button:hover,
+    #utility-drawer .utility-accordion summary:hover {
+        background: rgba(169,205,175,0.07) !important;
+    }
+    #utility-drawer .utility-accordion .form {
+        padding: 4px 12px 12px !important;
+        gap: 12px !important;
+    }
+    #utility-drawer .utility-number input { font-variant-numeric: tabular-nums !important; }
+    #utility-drawer .utility-form-note,
+    #utility-drawer .utility-form-note .prose,
+    #utility-drawer .utility-form-note p {
+        color: var(--utility-muted) !important;
+        font-size: 12px !important;
+        line-height: 1.55 !important;
+        margin: 0 !important;
+    }
     #utility-drawer .utility-log {
-        min-height: 280px !important;
-        max-height: 440px !important;
+        min-height: min(480px, 58vh) !important;
+        max-height: 62vh !important;
         padding: 0 !important;
         overflow: hidden !important;
     }
     #utility-drawer .utility-log textarea {
-        min-height: 280px !important;
-        max-height: 440px !important;
+        min-height: min(480px, 58vh) !important;
+        max-height: 62vh !important;
         resize: none !important;
         font-family: 'JetBrains Mono', 'Cascadia Mono', monospace !important;
-        font-size: 12px !important;
-        line-height: 1.6 !important;
+        font-size: 13px !important;
+        line-height: 1.7 !important;
         color: #D7DEE5 !important;
         background: rgba(8,11,15,0.78) !important;
         border: 1px solid var(--utility-border) !important;
-        padding: 12px !important;
-        white-space: pre !important;
+        padding: 14px !important;
+        white-space: pre-wrap !important;
+        overflow-wrap: anywhere !important;
+        word-break: break-word !important;
     }
     .overall-status {
         display: inline-block !important;
@@ -2525,7 +2783,17 @@ def create_ui():
         .voice-ball-btn { width: 132px !important; height: 132px !important; }
         .quick-actions { left: 18px !important; bottom: 12px !important; }
         .quick-action { min-width: 44px !important; padding: 9px 10px !important; font-size: 12px !important; }
-        .utility-drawer { left: 12px !important; bottom: 68px !important; width: calc(100vw - 24px) !important; max-height: calc(100vh - 96px) !important; }
+        .utility-drawer,
+        #utility-drawer[data-panel="settings"],
+        #utility-drawer[data-panel="logs"],
+        #utility-drawer[data-panel="status"] {
+            left: 12px !important;
+            bottom: 68px !important;
+            width: calc(100vw - 24px) !important;
+            max-height: calc(100vh - 96px) !important;
+        }
+        #utility-drawer .utility-form-grid { display: block !important; }
+        #utility-drawer .utility-form-grid > * { margin-bottom: 10px !important; }
     }
 
     /* ── Accessibility ─────────────────────────────────────────────────────── */
@@ -2568,6 +2836,11 @@ def create_ui():
             'utility-logs': '<span class="utility-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M8 8h8M8 12h8M8 16h5"/></svg></span>',
             'utility-status': '<span class="utility-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="8" cy="6" r="1.5"/><circle cx="16" cy="12" r="1.5"/><circle cx="10" cy="18" r="1.5"/></svg></span>'
         };
+        const utilityPanels = {
+            'utility-settings': 'settings',
+            'utility-logs': 'logs',
+            'utility-status': 'status'
+        };
         const mountUtilityIcons = () => {
             Object.entries(utilityIcons).forEach(([id, icon]) => {
                 const element = document.querySelector('#' + id);
@@ -2575,6 +2848,13 @@ def create_ui():
                     ? element : element && element.querySelector('button');
                 if (button && !button.querySelector('.utility-icon')) {
                     button.insertAdjacentHTML('afterbegin', icon);
+                }
+                if (button && !button.dataset.utilityPanelBound) {
+                    button.dataset.utilityPanelBound = 'true';
+                    button.addEventListener('click', () => {
+                        const drawer = document.querySelector('#utility-drawer');
+                        if (drawer) drawer.dataset.panel = utilityPanels[id];
+                    });
                 }
             });
         };
@@ -2588,6 +2868,15 @@ def create_ui():
                 if (closeButton) closeButton.click();
             }
         });
+        window.setInterval(() => {
+            const area = document.querySelector('#utility-drawer .utility-log textarea');
+            if (!area) return;
+            const length = String(area.value.length);
+            if (area.dataset.lastLogLength !== length) {
+                area.dataset.lastLogLength = length;
+                window.requestAnimationFrame(() => { area.scrollTop = area.scrollHeight; });
+            }
+        }, 400);
         window.setInterval(notifyAvatar, 1000);
     }
     """
@@ -2697,24 +2986,149 @@ def create_ui():
 
             with gr.Column(visible=False, elem_classes=["utility-view"]) as settings_view:
                 gr.Markdown("### 运行设置")
-                settings_summary = gr.HTML(render_runtime_settings())
+                with gr.Accordion(
+                    "当前运行信息（只读）", open=False,
+                    elem_classes=["utility-accordion", "utility-readonly"],
+                ):
+                    settings_summary = gr.HTML(render_runtime_settings())
                 gr.Markdown(
-                    "参考音频只会在点击“应用设置”后更新。模型路径、服务地址等运行参数仅展示，不在网页中修改。",
+                    "以下参数会在点击“应用运行设置”后保存，并从下一轮对话开始生效。模型版本、采样率、模型路径和服务地址涉及联动重载，保持只读。",
                     elem_classes=["utility-help"],
                 )
-                ref_audio_upload = gr.Audio(
-                    sources=["upload"], type="filepath", label="参考音频",
-                    elem_classes=["utility-field", "utility-upload"],
-                )
-                reference_text_input = gr.Textbox(
-                    value=ACTIVE_REF_TEXT, label="参考文本",
-                    lines=3, max_lines=5,
-                    elem_classes=["utility-field", "utility-textarea"],
-                )
-                apply_settings_btn = gr.Button(
-                    "应用设置", variant="primary", elem_classes=["utility-apply"],
+                with gr.Accordion(
+                    "对话生成（3 项）", open=True,
+                    elem_classes=["utility-accordion"],
+                ):
+                    with gr.Row(elem_classes=["utility-form-grid"]):
+                        llm_temperature_input = gr.Number(
+                            value=LLM_TEMPERATURE, label="回复随机性",
+                            info="0 更稳定，1.5 更发散", minimum=0, maximum=1.5,
+                            step=0.1, precision=2,
+                            elem_classes=["utility-field", "utility-number"],
+                        )
+                        llm_max_tokens_input = gr.Number(
+                            value=LLM_MAX_TOKENS, label="回复长度上限",
+                            info="128–4096 tokens", minimum=128, maximum=4096,
+                            step=128, precision=0,
+                            elem_classes=["utility-field", "utility-number"],
+                        )
+                    llm_keep_alive_input = gr.Dropdown(
+                        choices=["5m", "30m", "2h", "8h", "24h", "0"],
+                        value=LLM_KEEP_ALIVE, allow_custom_value=True,
+                        label="模型驻留时间", info="例如 30m、2h、24h；0 表示请求后卸载",
+                        elem_classes=["utility-field", "utility-select"],
+                    )
+
+                with gr.Accordion(
+                    "语音识别（4 项）", open=False,
+                    elem_classes=["utility-accordion"],
+                ):
+                    with gr.Row(elem_classes=["utility-form-grid"]):
+                        vad_threshold_input = gr.Number(
+                            value=VAD_THRESH, label="麦克风灵敏度阈值",
+                            info="越低越灵敏", minimum=0.1, maximum=0.9,
+                            step=0.05, precision=2,
+                            elem_classes=["utility-field", "utility-number"],
+                        )
+                        min_silence_input = gr.Number(
+                            value=MIN_SILENCE_MS, label="句尾静音等待（ms）",
+                            info="越短响应越快", minimum=300, maximum=1500,
+                            step=50, precision=0,
+                            elem_classes=["utility-field", "utility-number"],
+                        )
+                    with gr.Row(elem_classes=["utility-form-grid"]):
+                        max_audio_input = gr.Number(
+                            value=MAX_AUDIO_SEC, label="单次最长录音（秒）",
+                            minimum=5, maximum=60, step=5, precision=0,
+                            elem_classes=["utility-field", "utility-number"],
+                        )
+                        asr_language_input = gr.Dropdown(
+                            choices=["zh", "en", "ja", "ko"], value=ASR_LANG,
+                            allow_custom_value=True, label="识别语言",
+                            info="使用 zh、en、ja 等代码",
+                            elem_classes=["utility-field", "utility-select"],
+                        )
+
+                with gr.Accordion(
+                    "语音与数字人播放（7 项）", open=False,
+                    elem_classes=["utility-accordion"],
+                ):
+                    tts_style_input = gr.Dropdown(
+                        choices=[
+                            "语速自然", "语速稍慢，停顿自然",
+                            "语速舒缓，停顿清晰", "语气温柔，语速稍慢",
+                        ],
+                        value=VOXCPM_STYLE_PROMPT, allow_custom_value=True,
+                        label="语音风格", info="可直接输入 VoxCPM 风格描述",
+                        elem_classes=["utility-field", "utility-select"],
+                    )
+                    with gr.Row(elem_classes=["utility-form-grid"]):
+                        audio_gain_input = gr.Number(
+                            value=AVATAR_AUDIO_GAIN, label="播放音量增益",
+                            minimum=0.5, maximum=2.5, step=0.1, precision=2,
+                            elem_classes=["utility-field", "utility-number"],
+                        )
+                        prebuffer_input = gr.Number(
+                            value=AVATAR_PREBUFFER_MS, label="首段预缓冲（ms）",
+                            minimum=400, maximum=2500, step=100, precision=0,
+                            elem_classes=["utility-field", "utility-number"],
+                        )
+                    with gr.Row(elem_classes=["utility-form-grid"]):
+                        rebuffer_input = gr.Number(
+                            value=AVATAR_REBUFFER_MS, label="卡顿后再缓冲（ms）",
+                            minimum=100, maximum=1200, step=50, precision=0,
+                            elem_classes=["utility-field", "utility-number"],
+                        )
+                        max_buffer_input = gr.Number(
+                            value=AVATAR_MAX_BUFFER_MS, label="最大缓冲（ms）",
+                            minimum=2000, maximum=12000, step=500, precision=0,
+                            elem_classes=["utility-field", "utility-number"],
+                        )
+                    with gr.Row(elem_classes=["utility-form-grid"]):
+                        fade_in_input = gr.Number(
+                            value=AVATAR_FADE_IN_MS, label="开头淡入（ms）",
+                            minimum=0, maximum=200, step=10, precision=0,
+                            elem_classes=["utility-field", "utility-number"],
+                        )
+                        lead_in_input = gr.Number(
+                            value=AVATAR_LEAD_IN_MS, label="开口前留白（ms）",
+                            minimum=0, maximum=500, step=20, precision=0,
+                            elem_classes=["utility-field", "utility-number"],
+                        )
+
+                with gr.Accordion(
+                    "诊断（1 项）", open=False,
+                    elem_classes=["utility-accordion"],
+                ):
+                    log_level_input = gr.Dropdown(
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        value=LOG_LEVEL, label="日志级别",
+                        elem_classes=["utility-field", "utility-select"],
+                    )
+
+                apply_runtime_btn = gr.Button(
+                    "应用运行设置", variant="primary", elem_classes=["utility-apply"],
                 )
                 settings_result = gr.Markdown(elem_classes=["utility-status"])
+
+                with gr.Accordion(
+                    "音色参考", open=False,
+                    elem_classes=["utility-accordion"],
+                ):
+                    ref_audio_upload = gr.Audio(
+                        sources=["upload"], type="filepath", label="参考音频",
+                        elem_classes=["utility-field", "utility-upload"],
+                    )
+                    reference_text_input = gr.Textbox(
+                        value=ACTIVE_REF_TEXT, label="参考文本",
+                        lines=3, max_lines=5,
+                        elem_classes=["utility-field", "utility-textarea"],
+                    )
+                    apply_reference_btn = gr.Button(
+                        "应用音色", variant="secondary",
+                        elem_classes=["utility-secondary-action"],
+                    )
+                    reference_result = gr.Markdown(elem_classes=["utility-status"])
 
             with gr.Column(visible=False, elem_classes=["utility-view"]) as logs_view:
                 gr.Markdown("### 最近日志")
@@ -2722,6 +3136,11 @@ def create_ui():
                     logs_source = gr.Dropdown(
                         choices=["全部", "应用", "VoxCPM", "数字人", "桥接"],
                         value="全部", label="服务", scale=2,
+                        elem_classes=["utility-field", "utility-select"],
+                    )
+                    logs_limit = gr.Dropdown(
+                        choices=[100, 200, 500, 1000], value=500,
+                        label="行数", scale=1,
                         elem_classes=["utility-field", "utility-select"],
                     )
                     logs_refresh_btn = gr.Button(
@@ -2978,24 +3397,33 @@ def create_ui():
             return (
                 *drawer_state,
                 render_runtime_settings(),
+                *get_runtime_form_values(),
                 ACTIVE_REF_TEXT,
+                "",
                 "",
             )
 
-        def open_logs_panel(source):
-            return (*toggle_utility_panel("logs"), get_recent_logs(source))
+        def open_logs_panel(source, limit):
+            return (*toggle_utility_panel("logs"), get_recent_logs(source, limit))
 
         def open_status_panel():
             summary, details = refresh_status_details()
             return (*toggle_utility_panel("status"), summary, details)
 
-        def apply_settings_ui(file_path, prompt_text):
+        def apply_runtime_settings_ui(*form_values):
+            result = apply_runtime_settings(dict(zip(EDITABLE_RUNTIME_KEYS, form_values)))
+            if result.get("ok"):
+                return render_runtime_settings(), result.get("message", "运行设置已应用")
+            error = result.get("error", {})
+            return render_runtime_settings(), error.get("message", "运行设置应用失败")
+
+        def apply_reference_ui(file_path, prompt_text):
             result = apply_reference_audio(file_path, prompt_text or "")
             if result.get("ok"):
-                message = result.get("message", "设置已应用")
+                message = result.get("message", "音色已应用")
                 return render_runtime_settings(), message
             error = result.get("error", {})
-            return render_runtime_settings(), error.get("message", "设置应用失败")
+            return render_runtime_settings(), error.get("message", "音色应用失败")
 
         # ---- 绑定事件 ----
         settings_btn.click(
@@ -3003,12 +3431,18 @@ def create_ui():
             inputs=[],
             outputs=[
                 utility_drawer, utility_title, settings_view, logs_view,
-                status_view, settings_summary, reference_text_input, settings_result,
+                status_view, settings_summary,
+                llm_temperature_input, llm_max_tokens_input, llm_keep_alive_input,
+                vad_threshold_input, min_silence_input, max_audio_input,
+                asr_language_input, tts_style_input, audio_gain_input,
+                prebuffer_input, rebuffer_input, max_buffer_input,
+                fade_in_input, lead_in_input, log_level_input,
+                reference_text_input, settings_result, reference_result,
             ],
         )
         logs_btn.click(
             fn=open_logs_panel,
-            inputs=[logs_source],
+            inputs=[logs_source, logs_limit],
             outputs=[utility_drawer, utility_title, settings_view, logs_view, status_view, logs_output],
         )
         status_btn.click(
@@ -3021,14 +3455,35 @@ def create_ui():
             inputs=[],
             outputs=[utility_drawer, settings_view, logs_view, status_view],
         )
-        apply_settings_btn.click(
-            fn=apply_settings_ui,
-            inputs=[ref_audio_upload, reference_text_input],
+        apply_runtime_btn.click(
+            fn=apply_runtime_settings_ui,
+            inputs=[
+                llm_temperature_input, llm_max_tokens_input, llm_keep_alive_input,
+                vad_threshold_input, min_silence_input, max_audio_input,
+                asr_language_input, tts_style_input, audio_gain_input,
+                prebuffer_input, rebuffer_input, max_buffer_input,
+                fade_in_input, lead_in_input, log_level_input,
+            ],
             outputs=[settings_summary, settings_result],
+        )
+        apply_reference_btn.click(
+            fn=apply_reference_ui,
+            inputs=[ref_audio_upload, reference_text_input],
+            outputs=[settings_summary, reference_result],
         )
         logs_refresh_btn.click(
             fn=get_recent_logs,
-            inputs=[logs_source],
+            inputs=[logs_source, logs_limit],
+            outputs=[logs_output],
+        )
+        logs_source.change(
+            fn=get_recent_logs,
+            inputs=[logs_source, logs_limit],
+            outputs=[logs_output],
+        )
+        logs_limit.change(
+            fn=get_recent_logs,
+            inputs=[logs_source, logs_limit],
             outputs=[logs_output],
         )
         status_refresh_btn.click(
