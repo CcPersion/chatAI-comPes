@@ -41,6 +41,23 @@ def test_recent_logs_supports_up_to_one_thousand_lines(tmp_path, monkeypatch):
     assert "line-200" in output and "line-1199" in output
 
 
+def test_render_recent_logs_uses_readable_level_colors_and_escapes_content(tmp_path, monkeypatch):
+    log_path = tmp_path / "app.log"
+    log_path.write_text(
+        "[2026-08-10] INFO ready\n[2026-08-10] WARNING <slow>\n[2026-08-10] ERROR failed\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(app.LOG_SOURCE_PATHS, "搴旂敤", str(log_path))
+
+    rendered = app.render_recent_logs("搴旂敤", limit=10)
+
+    assert "utility-log-info" in rendered
+    assert "utility-log-warning" in rendered
+    assert "utility-log-error" in rendered
+    assert "&lt;slow&gt;" in rendered
+    assert "0001" in rendered and "0003" in rendered
+
+
 def test_runtime_settings_do_not_expose_model_or_service_paths():
     rendered = app.render_runtime_settings(app.get_runtime_settings())
 

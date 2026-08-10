@@ -1559,6 +1559,43 @@ def get_recent_logs(source: str = "全部", limit: int = 200) -> str:
     return "\n\n".join(blocks)
 
 
+def render_recent_logs(source: str = "全部", limit: int = 200) -> str:
+    """Render allow-listed logs as a readable, level-colored HTML viewer."""
+    plain_text = get_recent_logs(source, limit)
+    rendered_blocks = []
+    for block in plain_text.split("\n\n"):
+        lines = block.splitlines()
+        if not lines:
+            continue
+        title = html.escape(lines[0])
+        rendered_lines = []
+        visible_line = 0
+        for raw_line in lines[1:]:
+            visible_line += 1
+            level_match = re.search(r"\b(DEBUG|INFO|WARNING|ERROR|CRITICAL)\b", raw_line.upper())
+            level = level_match.group(1).lower() if level_match else "default"
+            rendered_lines.append(
+                f'<div class="utility-log-line utility-log-{level}">'
+                f'<span class="utility-log-number">{visible_line:04d}</span>'
+                f'<span class="utility-log-message">{html.escape(raw_line) or "&nbsp;"}</span>'
+                "</div>"
+            )
+        if not rendered_lines:
+            rendered_lines.append(
+                '<div class="utility-log-line utility-log-default">'
+                '<span class="utility-log-number">0001</span>'
+                '<span class="utility-log-message">暂无日志</span>'
+                "</div>"
+            )
+        rendered_blocks.append(
+            '<section class="utility-log-block">'
+            f'<div class="utility-log-source">{title}</div>'
+            f'{"".join(rendered_lines)}'
+            "</section>"
+        )
+    return '<div class="utility-log-scroll">' + "".join(rendered_blocks) + "</div>"
+
+
 STATUS_LABELS = {
     "llama": "大模型",
     "asr": "语音识别",
@@ -2725,21 +2762,73 @@ def create_ui():
         padding: 0 !important;
         overflow: hidden !important;
     }
-    #utility-drawer .utility-log textarea {
+    #utility-drawer .utility-log-scroll {
         min-height: min(480px, 58vh) !important;
         max-height: 62vh !important;
-        resize: none !important;
-        font-family: 'JetBrains Mono', 'Cascadia Mono', monospace !important;
-        font-size: 13px !important;
-        line-height: 1.7 !important;
-        color: #D7DEE5 !important;
-        background: rgba(8,11,15,0.78) !important;
+        overflow: auto !important;
+        padding: 14px 12px 18px !important;
         border: 1px solid var(--utility-border) !important;
-        padding: 14px !important;
-        white-space: pre-wrap !important;
+        border-radius: 10px !important;
+        background: #070B14 !important;
+        font-family: 'JetBrains Mono', 'Cascadia Mono', monospace !important;
+        font-size: 15px !important;
+        line-height: 1.65 !important;
+        white-space: normal !important;
+        scrollbar-color: rgba(169,205,175,0.46) rgba(255,255,255,0.05) !important;
+        scrollbar-width: thin !important;
+    }
+    #utility-drawer .utility-log-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+    #utility-drawer .utility-log-scroll::-webkit-scrollbar-track {
+        background: rgba(255,255,255,0.04);
+        border-radius: 8px;
+    }
+    #utility-drawer .utility-log-scroll::-webkit-scrollbar-thumb {
+        background: rgba(169,205,175,0.48);
+        border: 2px solid #070B14;
+        border-radius: 8px;
+    }
+    #utility-drawer .utility-log-block + .utility-log-block {
+        margin-top: 18px !important;
+        padding-top: 14px !important;
+        border-top: 1px solid rgba(139,158,180,0.24) !important;
+    }
+    #utility-drawer .utility-log-source {
+        position: sticky !important;
+        top: -14px !important;
+        z-index: 1 !important;
+        margin: -14px -12px 8px !important;
+        padding: 9px 12px 8px !important;
+        color: #EAF4FF !important;
+        background: #101A2B !important;
+        border-bottom: 1px solid rgba(133,184,255,0.34) !important;
+        font-family: system-ui, -apple-system, 'Segoe UI', sans-serif !important;
+        font-size: 14px !important;
+        font-weight: 700 !important;
+        letter-spacing: 0.02em !important;
+    }
+    #utility-drawer .utility-log-line {
+        display: grid !important;
+        grid-template-columns: 44px minmax(0, 1fr) !important;
+        gap: 10px !important;
+        align-items: start !important;
+        min-height: 25px !important;
+    }
+    #utility-drawer .utility-log-number {
+        color: #71809A !important;
+        font-size: 13px !important;
+        text-align: right !important;
+        user-select: none !important;
+    }
+    #utility-drawer .utility-log-message {
+        color: #DCE7F2 !important;
         overflow-wrap: anywhere !important;
         word-break: break-word !important;
     }
+    #utility-drawer .utility-log-info .utility-log-message { color: #8FC4FF !important; }
+    #utility-drawer .utility-log-debug .utility-log-message { color: #C5A8FF !important; }
+    #utility-drawer .utility-log-warning .utility-log-message { color: #FFD36A !important; }
+    #utility-drawer .utility-log-error .utility-log-message,
+    #utility-drawer .utility-log-critical .utility-log-message { color: #FF8C9D !important; }
     .overall-status {
         display: inline-block !important;
         color: var(--utility-muted) !important;
@@ -2869,7 +2958,7 @@ def create_ui():
             }
         });
         window.setInterval(() => {
-            const area = document.querySelector('#utility-drawer .utility-log textarea');
+            const area = document.querySelector('#utility-drawer .utility-log-scroll');
             if (!area) return;
             const length = String(area.value.length);
             if (area.dataset.lastLogLength !== length) {
@@ -3147,9 +3236,9 @@ def create_ui():
                         "刷新", scale=0, min_width=72,
                         elem_classes=["utility-secondary-action"],
                     )
-                logs_output = gr.Textbox(
-                    value="点击刷新查看最近日志。",
-                    lines=18, max_lines=24, interactive=False, show_label=False,
+                logs_output = gr.HTML(
+                    value='<div class="utility-log-scroll"><div class="utility-log-line utility-log-default"><span class="utility-log-number">0001</span><span class="utility-log-message">点击刷新查看最近日志。</span></div></div>',
+                    show_label=False,
                     elem_classes=["utility-field", "utility-log"],
                 )
 
@@ -3404,7 +3493,7 @@ def create_ui():
             )
 
         def open_logs_panel(source, limit):
-            return (*toggle_utility_panel("logs"), get_recent_logs(source, limit))
+            return (*toggle_utility_panel("logs"), render_recent_logs(source, limit))
 
         def open_status_panel():
             summary, details = refresh_status_details()
@@ -3472,17 +3561,17 @@ def create_ui():
             outputs=[settings_summary, reference_result],
         )
         logs_refresh_btn.click(
-            fn=get_recent_logs,
+            fn=render_recent_logs,
             inputs=[logs_source, logs_limit],
             outputs=[logs_output],
         )
         logs_source.change(
-            fn=get_recent_logs,
+            fn=render_recent_logs,
             inputs=[logs_source, logs_limit],
             outputs=[logs_output],
         )
         logs_limit.change(
-            fn=get_recent_logs,
+            fn=render_recent_logs,
             inputs=[logs_source, logs_limit],
             outputs=[logs_output],
         )
