@@ -90,6 +90,7 @@ class LiveTalkingAudioPlayout:
         self._input_rate: Optional[int] = None
         self._pending = np.empty(0, dtype=np.float32)
         self._fade_remaining = 0
+        self._prime_frames_remaining = 0
 
         self._utterances = 0
         self._frames_sent = 0
@@ -192,14 +193,8 @@ class LiveTalkingAudioPlayout:
         )
         self._pending = np.empty(0, dtype=np.float32)
         self._fade_remaining = self.fade_in_samples
+        self._prime_frames_remaining = self.lead_in_frames
         self._utterances += 1
-        # Give WebRTC/LiveTalking a short run of clocked silence before speech.
-        # This primes the downstream audio/video path without changing pitch or
-        # inserting discontinuities into the first synthesized samples.
-        for _ in range(self.lead_in_frames):
-            self._put_frame_locked(
-                np.zeros(self.frame_samples, dtype=np.float32)
-            )
 
     def _apply_fade_locked(self, audio: np.ndarray) -> np.ndarray:
         if not audio.size or self._fade_remaining <= 0:
@@ -253,9 +248,13 @@ class LiveTalkingAudioPlayout:
             audio = raw.astype(np.float32) / 32768.0
         else:
             audio = raw.astype(np.float32)
-        # A stable utterance-level gain avoids the per-model-chunk pumping that
-        # was especially audible during the first second of every reply.
-        audio = np.clip(audio * self.gain, -0.95, 0.95)
+        # A stable gain avoids per-chunk pumping. Above unity, tanh acts as a
+        # transparent soft limiter for normal speech while preventing boosted
+        # VoxCPM peaks from turning into hard-clipping noise.
+        if self.gain > 1.0:
+            audio = np.tanh(audio * self.gain).astype(np.float32)
+        else:
+            audio = np.clip(audio * self.gain, -0.95, 0.95)
 
         try:
             with self._condition:
@@ -317,6 +316,7 @@ class LiveTalkingAudioPlayout:
             self._input_rate = None
             self._accepting = False
             self._producer_done = True
+            self._prime_frames_remaining = 0
             self._playing.clear()
             # One zero frame gives the downstream mouth driver a clean stop.
             try:
@@ -359,6 +359,19 @@ class LiveTalkingAudioPlayout:
                 continue
 
             self._playing.set()
+            # Prime LiveTalking's own ASR queue in a short burst. Sending this
+            # silence on the normal 20 ms clock did not build any downstream
+            # margin, so normal HTTP/WSL scheduling jitter could make the mouth
+            # driver alternate between speech and silence during the first
+            # words. Once primed, speech itself remains strictly clocked.
+            with self._condition:
+                prime_frames = self._prime_frames_remaining
+                self._prime_frames_remaining = 0
+            zero_frame = np.zeros(self.frame_samples, dtype=np.float32)
+            for _ in range(prime_frames):
+                if not self._wire_frame(zero_frame):
+                    return
+
             next_deadline = time.monotonic()
             utterance_underflows = 0
             fade_after_rebuffer = False

@@ -32,6 +32,66 @@ def test_ndjson_generation_events_are_ordered_without_gpu():
     assert events[1]["sample_rate"] == events[2]["sample_rate"] == 48000
 
 
+def test_voxcpm2_uses_isolated_reference_without_prompt_continuation(tmp_path):
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF-test")
+    captured = {}
+
+    class FakeModel:
+        tts_model = type("T", (), {"sample_rate": 48000})()
+
+        def generate_streaming(self, **kwargs):
+            captured.update(kwargs)
+            return iter([np.array([0.0, 0.1], dtype=np.float32)])
+
+    runtime = VoxCPMRuntime(
+        "/missing",
+        "VoxCPM2",
+        "balanced-v2",
+        ref_wav=str(reference),
+        ref_text="reference transcript",
+    )
+    runtime.model = FakeModel()
+    runtime.actual_sample_rate = 48000
+
+    list(runtime.synthesize("hello", "req", "conv", "gen", runtime.registry.start("gen")))
+    runtime.registry.finish("gen")
+
+    assert captured["reference_wav_path"] == str(reference.resolve())
+    assert "prompt_wav_path" not in captured
+    assert "prompt_text" not in captured
+
+
+def test_voxcpm15_keeps_prompt_continuation_contract(tmp_path):
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF-test")
+    captured = {}
+
+    class FakeModel:
+        tts_model = type("T", (), {"sample_rate": 44100})()
+
+        def generate_streaming(self, **kwargs):
+            captured.update(kwargs)
+            return iter([np.array([0.0, 0.1], dtype=np.float32)])
+
+    runtime = VoxCPMRuntime(
+        "/missing",
+        "VoxCPM1.5",
+        "safe-v15",
+        ref_wav=str(reference),
+        ref_text="reference transcript",
+    )
+    runtime.model = FakeModel()
+    runtime.actual_sample_rate = 44100
+
+    list(runtime.synthesize("hello", "req", "conv", "gen", runtime.registry.start("gen")))
+    runtime.registry.finish("gen")
+
+    assert captured["prompt_wav_path"] == str(reference.resolve())
+    assert captured["prompt_text"] == "reference transcript"
+    assert "reference_wav_path" not in captured
+
+
 def test_cancel_is_generation_scoped_and_idempotent_for_finished_generation():
     registry = GenerationRegistry()
     registry.start("gen-old")

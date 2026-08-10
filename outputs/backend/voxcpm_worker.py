@@ -229,10 +229,16 @@ class VoxCPMRuntime:
             if not os.path.isfile(self.ref_wav):
                 yield {"type": "error", "request_id": request_id, "generation_id": generation_id, "error": {"code": "TTS_REF_001", "message": "reference wav not found"}}
                 return
-            kwargs["prompt_wav_path"] = self.ref_wav
-            kwargs["prompt_text"] = self.ref_text
             if self.model_id == "VoxCPM2":
+                # VoxCPM2 reference-only cloning avoids the continuation seam
+                # created when the same clip is also supplied as prompt audio.
+                # It still supports native parenthesized speed/style control.
                 kwargs["reference_wav_path"] = self.ref_wav
+            else:
+                # VoxCPM1.5 has no isolated reference input and therefore keeps
+                # the legacy prompt-audio continuation contract.
+                kwargs["prompt_wav_path"] = self.ref_wav
+                kwargs["prompt_text"] = self.ref_text
         started = now_ms()
         yield {"type": "generation.started", "request_id": request_id, "conversation_id": conversation_id, "generation_id": generation_id, "model_id": self.model_id, "sample_rate": self.actual_sample_rate, "audio_format": "pcm_s16le_mono", "reference_id": self.reference_id(), "started_at_ms": started}
         sequence = 0

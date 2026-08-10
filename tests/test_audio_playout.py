@@ -128,7 +128,41 @@ def test_playout_primes_webrtc_with_silence_before_faded_speech():
     first_frames = [np.frombuffer(frame, dtype="<i2") for frame in post.frames[:3]]
     assert len(first_frames) == 3
     assert all(np.count_nonzero(frame) == 0 for frame in first_frames)
+    # The lead-in must be delivered as downstream queue priming, not paced at
+    # 20 ms like speech. Otherwise it adds latency without absorbing jitter.
+    assert post.times[2] - post.times[0] < 0.02
     assert any(
         np.count_nonzero(np.frombuffer(frame, dtype="<i2")) > 0
         for frame in post.frames[3:]
     )
+
+
+def test_playout_boosts_quiet_speech_and_soft_limits_loud_peaks():
+    def render(audio, gain):
+        post = _RecordingPost()
+        playout = LiveTalkingAudioPlayout(
+            "http://livetalking.test",
+            prebuffer_ms=100,
+            max_buffer_ms=1000,
+            fade_in_ms=0,
+            lead_in_ms=0,
+            gain=gain,
+            post=post,
+        )
+        _send_in_model_chunks(playout, audio, sample_rate=16000)
+        playout.close()
+        return np.concatenate(
+            [np.frombuffer(frame, dtype="<i2").astype(np.float32) for frame in post.frames]
+        )
+
+    quiet = _tone(sample_rate=16000, seconds=0.28)
+    baseline = render(quiet, 1.0)
+    boosted = render(quiet, 1.8)
+    baseline_rms = float(np.sqrt(np.mean(np.square(baseline))))
+    boosted_rms = float(np.sqrt(np.mean(np.square(boosted))))
+    assert boosted_rms > baseline_rms * 1.5
+
+    loud = np.full(round(16000 * 0.28), 0.9, dtype=np.float32)
+    limited = render(loud, 1.8)
+    peak = int(np.max(np.abs(limited)))
+    assert 29000 < peak < 32000
