@@ -26,9 +26,8 @@ MAX_AUDIO_SEC: 20
 # ---------------------------------------------------------------------------
 # ASR (Automatic Speech Recognition) 语音识别
 # ---------------------------------------------------------------------------
-ASR_MODEL: "large-v3"
-# faster-whisper 模型名称。可选: "tiny", "base", "small", "medium", "large-v3"。
-# 中文识别推荐 large-v3。
+ASR_MODEL: "/root/setup/models/faster-whisper-large-v3"
+# 直接使用已下载的本地模型目录；离线模式下不能只写 large-v3 别名。
 
 ASR_LANG: "zh"
 # 转写目标语言。中文使用 "zh"。
@@ -37,7 +36,7 @@ ASR_LANG: "zh"
 # ---------------------------------------------------------------------------
 # LLM (Large Language Model) 大模型
 # ---------------------------------------------------------------------------
-LLM_BASE_URL: "http://localhost:11434"
+LLM_BASE_URL: "http://172.19.80.1:11434"
 # llama.cpp llama-server 的地址（WSL2 内通过 localhostForwarding 访问 Windows 侧服务）。
 # 若 localhostForwarding 不可用，改为 Windows 主机 IP（见 /etc/resolv.conf 中的 nameserver），
 # 如 "http://172.30.96.1:8090"。
@@ -52,20 +51,37 @@ LLM_MAX_TOKENS: 1024
 
 LLM_TEMPERATURE: 0.7
 # LLM 生成温度。0=确定性，1=随机性高。
+LLM_KEEP_ALIVE: "24h"
+# Ollama 预热请求的模型驻留时间，避免空闲后首轮冷启动。
+LLM_WARMUP_ENABLED: true
+# 启动时顺序预热 TTS 克隆音色和 Ollama，首轮不再承担模型加载成本。
 
 # ---------------------------------------------------------------------------
 # TTS (Text-to-Speech) 语音合成
 # ---------------------------------------------------------------------------
+TTS_BACKEND: "cosyvoice"
+# 预热音频只用于后台热身，不在正式回答前播放，避免等待阶段出现杂音。
+TTS_BACKCHANNEL_ENABLED: false
+COSYVOICE_REPO: "/root/setup/CosyVoice"
+COSYVOICE_MODEL_PATH: "~/setup/models/Fun-CosyVoice3-0.5B"
+COSYVOICE_FP16: true
+# CosyVoice3 首块 token 数；更小首块更快，后续块自动放大保持音质。
+# Keep the official CosyVoice3 streaming block size; smaller values do not
+# match the model's trained static chunk and were slower in local QA.
+COSYVOICE_STREAM_HOP_TOKENS: 0
+# edge = 极速神经网络女声；qwen = 本地克隆音色但延迟较高。
+EDGE_TTS_VOICE: "zh-CN-XiaoxiaoNeural"
+EDGE_TTS_RATE: "+0%"
+QWEN_ATTN_IMPLEMENTATION: "sdpa"
 TTS_MODEL_PATH: "~/setup/models/Qwen3-TTS-1.7B"
 # Qwen3-TTS 1.7B 模型权重目录。
 
-TTS_REF_WAV: "~/setup/ref.wav"
+TTS_REF_WAV: "~/setup/ref-fast.wav"
 # 音色克隆参考音频路径。
 # 用户上传音频会覆盖此路径（原文件备份到 uploads/）。
 
-TTS_REF_TEXT: ""
-# 参考音频的对应文本（可选，用于提升克隆质量）。
-# 若留空，TTS 引擎自动处理。
+TTS_REF_TEXT: "大家好，我是主播，很多人在看我的视频之后呢，都说我讲话好温柔。"
+# 使用 5 秒对齐片段作为运行时提示，保留克隆音色同时减少首轮提示上下文。
 
 TTS_SAMPLE_RATE: 16000
 # TTS 输出音频采样率（Hz）。16kHz 兼顾质量与传输效率。

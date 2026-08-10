@@ -65,9 +65,73 @@
 
 <script>
 var pc = null;
+var reconnectTimer = null;
+var reconnectDelay = 1000;
+var connecting = false;
 var videoEl = document.getElementById('video');
 var placeholder = document.getElementById('placeholder');
 var statusText = document.getElementById('status-text');
+var mediaStream = null;
+var audioEnabled = false;
+var stopped = false;
+var SESSION_ID = '0';
+var LEASE_KEY = 'psychic-waddle-avatar-lease-v1';
+var INSTANCE_ID = (window.crypto && window.crypto.randomUUID)
+  ? window.crypto.randomUUID()
+  : String(Date.now()) + '-' + String(Math.random()).slice(2);
+var hasSessionLease = false;
+var leaseTimer = null;
+
+function parseLease(value) {
+  try { return value ? JSON.parse(value) : null; } catch (error) { return null; }
+}
+
+function claimSessionLease() {
+  if (stopped) return false;
+  try {
+    var current = parseLease(window.localStorage.getItem(LEASE_KEY));
+    if (current && current.id !== INSTANCE_ID && current.expiresAt > Date.now()) {
+      hasSessionLease = false;
+      return false;
+    }
+    window.localStorage.setItem(LEASE_KEY, JSON.stringify({
+      id: INSTANCE_ID,
+      expiresAt: Date.now() + 6000
+    }));
+    var written = parseLease(window.localStorage.getItem(LEASE_KEY));
+    hasSessionLease = !!written && written.id === INSTANCE_ID;
+  } catch (error) {
+    // If storage is disabled, retain the original single-page behavior.
+    hasSessionLease = true;
+  }
+  return hasSessionLease;
+}
+
+function refreshSessionLease() {
+  if (!hasSessionLease) {
+    if (claimSessionLease()) connect();
+    return;
+  }
+  try {
+    var current = parseLease(window.localStorage.getItem(LEASE_KEY));
+    if (!current || current.id !== INSTANCE_ID) {
+      hasSessionLease = false;
+      stopConnection(false);
+      return;
+    }
+    current.expiresAt = Date.now() + 6000;
+    window.localStorage.setItem(LEASE_KEY, JSON.stringify(current));
+  } catch (error) {}
+}
+
+function releaseSessionLease() {
+  if (!hasSessionLease) return;
+  try {
+    var current = parseLease(window.localStorage.getItem(LEASE_KEY));
+    if (current && current.id === INSTANCE_ID) window.localStorage.removeItem(LEASE_KEY);
+  } catch (error) {}
+  hasSessionLease = false;
+}
 
 function revealVideo() {
   placeholder.style.display = 'none';
@@ -75,35 +139,120 @@ function revealVideo() {
   requestAnimationFrame(function() { videoEl.style.opacity = '1'; });
 }
 
-function connect() {
-  pc = new RTCPeerConnection({ sdpSemantics: 'unified-plan' });
-  pc.addTransceiver('video', { direction: 'recvonly' });
-  pc.addTransceiver('audio', { direction: 'recvonly' });
+function scheduleReconnect(message) {
+  if (stopped || !hasSessionLease) return;
+  if (message) statusText.textContent = message;
+  if (reconnectTimer || connecting) return;
+  reconnectTimer = window.setTimeout(function() {
+    reconnectTimer = null;
+    connect();
+  }, reconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 2, 8000);
+}
 
-  pc.addEventListener('track', function(evt) {
+function stopConnection(releaseLease) {
+  if (reconnectTimer) {
+    window.clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  connecting = false;
+  var oldPc = pc;
+  pc = null;
+  if (oldPc) {
+    try { oldPc.close(); } catch (error) {}
+  }
+  if (videoEl.srcObject) {
+    try {
+      videoEl.srcObject.getTracks().forEach(function(track) { track.stop(); });
+    } catch (error) {}
+    videoEl.srcObject = null;
+  }
+  mediaStream = null;
+  if (releaseLease) releaseSessionLease();
+}
+
+function connect() {
+  if (stopped || !hasSessionLease || connecting) return;
+  connecting = true;
+  if (pc) {
+    stopConnection(false);
+    connecting = true;
+  }
+  mediaStream = new MediaStream();
+  videoEl.srcObject = mediaStream;
+  // Start muted so Chromium can establish the WebRTC media element. The
+  // parent page sends enable-audio after the user's first gesture.
+  videoEl.muted = !audioEnabled;
+  videoEl.volume = 1.0;
+  pc = new RTCPeerConnection({ sdpSemantics: 'unified-plan' });
+  var currentPc = pc;
+  currentPc.addTransceiver('video', { direction: 'recvonly' });
+  currentPc.addTransceiver('audio', { direction: 'recvonly' });
+
+  currentPc.addEventListener('track', function(evt) {
+    if (pc !== currentPc || !hasSessionLease) return;
+    if (evt.streams && evt.streams.length) {
+      mediaStream = evt.streams[0];
+    } else if (evt.track && !mediaStream.getTracks().some(function(track) {
+      return track.id === evt.track.id;
+    })) {
+      mediaStream.addTrack(evt.track);
+    }
+    videoEl.srcObject = mediaStream;
     if (evt.track.kind === 'video') {
-      videoEl.srcObject = new MediaStream([evt.track]);
+      // Some Chromium/WebRTC combinations do not emit loadeddata for a
+      // remote track while the element is display:none. Reveal on track as
+      // well, then keep the media events as a second confirmation.
+      revealVideo();
       videoEl.onloadeddata = revealVideo;
       videoEl.onplaying = revealVideo;
       videoEl.play().catch(function() {});
+    } else if (evt.track.kind === 'audio') {
+      // LiveTalking returns the synchronized mouth-driving audio as a WebRTC
+      // track. Keep it on the same media element as the video so the browser
+      // does not mute the actual cloned voice after the UI refreshes.
+      videoEl.muted = !audioEnabled;
+      videoEl.volume = 1.0;
+      videoEl.play().catch(function(error) {
+        statusText.textContent = '请点击页面开启声音';
+        console.warn('Audio autoplay blocked:', error);
+      });
     }
   });
 
-  pc.addEventListener('iceconnectionstatechange', function() {
-    statusText.textContent = 'ICE: ' + pc.iceConnectionState;
-    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+  currentPc.addEventListener('iceconnectionstatechange', function() {
+    if (pc !== currentPc || !hasSessionLease) return;
+    statusText.textContent = 'ICE: ' + currentPc.iceConnectionState;
+    if (currentPc.iceConnectionState === 'connected' || currentPc.iceConnectionState === 'completed') {
       statusText.textContent = '已连接';
+      reconnectDelay = 1000;
+    } else if (currentPc.iceConnectionState === 'failed' || currentPc.iceConnectionState === 'closed') {
+      connecting = false;
+      scheduleReconnect('连接已断开，正在重连...');
+    }
+  });
+  currentPc.addEventListener('connectionstatechange', function() {
+    if (pc !== currentPc || !hasSessionLease) return;
+    if (currentPc.connectionState === 'connected') {
+      connecting = false;
+      reconnectDelay = 1000;
+    } else if (currentPc.connectionState === 'failed' || currentPc.connectionState === 'closed') {
+      connecting = false;
+      scheduleReconnect('视频连接已断开，正在重连...');
     }
   });
 
-  pc.createOffer()
-    .then(function(offer) { return pc.setLocalDescription(offer); })
+  currentPc.createOffer()
+    .then(function(offer) {
+      if (pc !== currentPc || !hasSessionLease) throw new Error('WebRTC lease lost');
+      return currentPc.setLocalDescription(offer);
+    })
     .then(function() {
       return new Promise(function(resolve) {
-        if (pc.iceGatheringState === 'complete') return resolve();
-        pc.addEventListener('icegatheringstatechange', function check() {
-          if (pc.iceGatheringState === 'complete') {
-            pc.removeEventListener('icegatheringstatechange', check);
+        if (currentPc.iceGatheringState === 'complete') return resolve();
+        currentPc.addEventListener('icegatheringstatechange', function check() {
+          if (currentPc.iceGatheringState === 'complete') {
+            currentPc.removeEventListener('icegatheringstatechange', check);
             resolve();
           }
         });
@@ -112,23 +261,96 @@ function connect() {
     .then(function() {
       return fetch('/offer', {
         body: JSON.stringify({
-          sdp: pc.localDescription.sdp,
-          type: pc.localDescription.type,
-          sessionid: '0'
+          sdp: currentPc.localDescription.sdp,
+          type: currentPc.localDescription.type,
+          sessionid: SESSION_ID
         }),
         headers: { 'Content-Type': 'application/json' },
         method: 'POST'
       });
     })
-    .then(function(resp) { return resp.json(); })
-    .then(function(answer) { return pc.setRemoteDescription(answer); })
+    .then(function(resp) {
+      if (!resp.ok) throw new Error('LiveTalking offer HTTP ' + resp.status);
+      return resp.json();
+    })
+    .then(function(answer) {
+      if (pc !== currentPc || !hasSessionLease) return;
+      connecting = false;
+      return currentPc.setRemoteDescription(answer);
+    })
     .catch(function(error) {
-      statusText.textContent = '连接失败，请确认 LiveTalking 已启动';
+      if (pc !== currentPc || !hasSessionLease) return;
+      connecting = false;
+      scheduleReconnect('连接失败，正在重试...');
       console.error('WebRTC error:', error);
     });
 }
 
-connect();
+window.addEventListener('message', function(evt) {
+  if (evt.data && evt.data.type === 'enable-audio') {
+    audioEnabled = true;
+    videoEl.muted = false;
+    videoEl.volume = 1.0;
+    videoEl.play().catch(function(error) {
+      console.warn('Audio unlock failed:', error);
+    });
+  }
+});
+
+window.addEventListener('storage', function(evt) {
+  if (evt.key !== LEASE_KEY || !evt.newValue) return;
+  var next = parseLease(evt.newValue);
+  if (next && next.id !== INSTANCE_ID && next.expiresAt > Date.now()) {
+    hasSessionLease = false;
+    stopConnection(false);
+  }
+});
+
+window.addEventListener('pagehide', function() {
+  stopped = true;
+  stopConnection(true);
+});
+
+claimSessionLease();
+if (hasSessionLease) connect();
+leaseTimer = window.setInterval(refreshSessionLease, 2000);
+
+// Some WebRTC stacks report a server-side close asynchronously. Polling the
+// state as a backstop keeps an idle page from getting stuck on the last frame.
+window.setInterval(function() {
+  if (!pc) return;
+  var state = pc.connectionState || pc.iceConnectionState;
+  if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+    connecting = false;
+    scheduleReconnect('视频连接已断开，正在重连...');
+  }
+}, 2000);
+
+// Keep the browser-side session aligned with LiveTalking's session manager.
+// WebRTC can look connected locally after the server has already evicted the
+// session, so the explicit API probe is the reliable recovery signal.
+window.setInterval(function() {
+  if (!hasSessionLease || !pc || connecting) return;
+  var currentPc = pc;
+  fetch('/is_speaking', {
+    body: JSON.stringify({ sessionid: SESSION_ID }),
+    headers: { 'Content-Type': 'application/json' },
+    method: 'POST'
+  })
+    .then(function(resp) { return resp.json(); })
+    .then(function(result) {
+      if (pc !== currentPc || !hasSessionLease) return;
+      if (result.code !== 0) {
+        stopConnection(false);
+        scheduleReconnect('视频会话已刷新，正在重连...');
+      }
+    })
+    .catch(function() {
+      if (pc !== currentPc || !hasSessionLease) return;
+      connecting = false;
+      scheduleReconnect('视频服务暂时不可用，正在重连...');
+    });
+}, 5000);
 </script>
 </body>
 </html>

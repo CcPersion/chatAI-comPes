@@ -118,10 +118,21 @@ LLM_BASE_URL = str(config.get("LLM_BASE_URL", "http://localhost:8090"))
 LLM_MODEL = str(config.get("LLM_MODEL", "qwen3-8b"))
 LLM_MAX_TOKENS = int(config.get("LLM_MAX_TOKENS", 1024))
 LLM_TEMPERATURE = float(config.get("LLM_TEMPERATURE", 0.7))
+LLM_KEEP_ALIVE = str(config.get("LLM_KEEP_ALIVE", "30m"))
+LLM_WARMUP_ENABLED = bool(config.get("LLM_WARMUP_ENABLED", True))
 TTS_MODEL_PATH = os.path.expanduser(str(config.get("TTS_MODEL_PATH", "~/setup/models/Qwen3-TTS-1.7B")))
 TTS_REF_WAV = os.path.expanduser(str(config.get("TTS_REF_WAV", "~/setup/ref.wav")))
 TTS_REF_TEXT = str(config.get("TTS_REF_TEXT", ""))
 TTS_SAMPLE_RATE = int(config.get("TTS_SAMPLE_RATE", 16000))
+TTS_BACKEND = str(config.get("TTS_BACKEND", "qwen")).strip().lower()
+TTS_BACKCHANNEL_ENABLED = bool(config.get("TTS_BACKCHANNEL_ENABLED", False))
+COSYVOICE_REPO = os.path.expanduser(str(config.get("COSYVOICE_REPO", "/root/setup/CosyVoice")))
+COSYVOICE_MODEL_PATH = os.path.expanduser(str(config.get("COSYVOICE_MODEL_PATH", "~/setup/models/CosyVoice2-0.5B")))
+COSYVOICE_FP16 = bool(config.get("COSYVOICE_FP16", True))
+COSYVOICE_STREAM_HOP_TOKENS = int(config.get("COSYVOICE_STREAM_HOP_TOKENS", 0))
+EDGE_TTS_VOICE = str(config.get("EDGE_TTS_VOICE", "zh-CN-XiaoxiaoNeural"))
+EDGE_TTS_RATE = str(config.get("EDGE_TTS_RATE", "+0%"))
+QWEN_ATTN_IMPLEMENTATION = str(config.get("QWEN_ATTN_IMPLEMENTATION", "sdpa"))
 LIVETALKING_URL = str(config.get("LIVETALKING_URL", "http://localhost:8010"))
 AVATAR_SYNC_URL = str(config.get("AVATAR_SYNC_URL", "http://localhost:8011"))
 UPLOAD_DIR = os.path.expanduser(str(config.get("UPLOAD_DIR", "~/setup/uploads")))
@@ -373,6 +384,7 @@ class ASREngine:
                 device=device,
                 compute_type=compute_type,
                 download_root=os.path.expanduser("~/setup/models/faster-whisper-large-v3"),
+                local_files_only=True,
             )
             logger.info("ASR: 模型加载完成")
         except Exception as e:
@@ -477,6 +489,8 @@ class LLMClient:
             "temperature": LLM_TEMPERATURE,
             "max_tokens": LLM_MAX_TOKENS,
         }
+        if LLM_KEEP_ALIVE:
+            payload["keep_alive"] = LLM_KEEP_ALIVE
 
         try:
             with self.client.stream("POST", url, json=payload) as response:
@@ -524,6 +538,34 @@ class LLMClient:
             logger.error(f"LLM 异常: {traceback.format_exc()}")
             raise PipelineError("LLM_ERR_003", "大模型回复超时，请重试", str(e))
 
+    def warmup(self):
+        """让本地模型在用户开口前完成加载，避免首轮回复被冷启动拖慢。"""
+        if not LLM_WARMUP_ENABLED:
+            return
+        payload = {
+            "model": LLM_MODEL,
+            "messages": [{"role": "user", "content": "你好"}],
+            "stream": False,
+            "options": {"temperature": 0, "num_predict": 1},
+        }
+        if LLM_KEEP_ALIVE:
+            payload["keep_alive"] = LLM_KEEP_ALIVE
+        started_at = time.perf_counter()
+        try:
+            response = self.client.post(
+                f"{self.base_url}/api/chat",
+                json=payload,
+                timeout=httpx.Timeout(45.0, connect=5.0),
+            )
+            response.raise_for_status()
+            logger.info(
+                "LLM: 模型预热完成, 耗时=%.2fs, keep_alive=%s",
+                time.perf_counter() - started_at,
+                LLM_KEEP_ALIVE or "off",
+            )
+        except Exception as e:
+            logger.warning("LLM: 预热失败，首次对话仍会按需加载: %s", e)
+
 
 # 全局 LLM 客户端
 llm_client = LLMClient()
@@ -555,9 +597,102 @@ def split_sentences(text: str) -> list:
     return [s for s in merged if s]
 
 
+def pop_tts_units(buffer: str, final: bool = False) -> Tuple[list, str]:
+    """从正在生成的回复中取出可安全交给 TTS 的语义片段。
+
+    Qwen3-TTS 的 Python 接口当前返回完整音频数组，因此这里把 LLM 的流式
+    输出切成句子/较长分句，让第一段音频可以在整段回复结束前开始合成。
+    这不会截断回复，只改变 TTS 的提交边界。
+    """
+    units = []
+    remaining = buffer
+    while remaining:
+        sentence_match = re.search(r"^(.+?[。！？；.!?;\n])", remaining, re.S)
+        if sentence_match:
+            candidate = sentence_match.group(1).strip()
+            if len(candidate) >= 5:
+                units.append(candidate)
+                remaining = remaining[sentence_match.end():]
+                continue
+
+        # 没有完整句号时，在自然逗号后保留几个字再切一段。
+        # 这样像“你好呀，愿你……”这类回复不会等到整句结束才开始
+        # 克隆音色合成；切的是 TTS 提交边界，不会截断界面里的完整回复。
+        if not final and len(remaining) >= 10:
+            clause_match = re.search(r"^(.{3,}?[，,].{3,})", remaining, re.S)
+            if clause_match:
+                units.append(clause_match.group(1).strip())
+                remaining = remaining[clause_match.end():]
+                continue
+        break
+
+    if final and remaining.strip():
+        units.append(remaining.strip())
+        remaining = ""
+    return units, remaining
+
+
+def normalize_tts_text(text: str) -> str:
+    """去掉克隆 TTS 不稳定的 emoji/控制符，保留界面里的原始回复文本。"""
+    cleaned = re.sub(
+        r"[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF]",
+        "",
+        text,
+    )
+    cleaned = re.sub(r"[\u200B-\u200D\uFE0E\uFE0F]", "", cleaned)
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
 # =============================================================================
 # TTS 模块（Qwen3-TTS 1.7B + 音色克隆，#5 架构设计）
 # =============================================================================
+
+class EdgeTTSEngine:
+    """Low-latency neural TTS used by the immersive realtime mode."""
+
+    def __init__(self):
+        import edge_tts  # noqa: F401 - fail fast when the optional backend is absent
+        self.voice = EDGE_TTS_VOICE
+        self.rate = EDGE_TTS_RATE
+        logger.info(f"TTS: 极速模式已就绪 ({self.voice}, rate={self.rate})")
+
+    def synthesize(self, text: str, ref_wav_path: Optional[str] = None,
+                   cancel_event: Optional[threading.Event] = None) -> Tuple[Optional[np.ndarray], int]:
+        if cancel_event and cancel_event.is_set():
+            return None, 0
+
+        import edge_tts
+        import soundfile as sf
+
+        started_at = time.perf_counter()
+        temp_path = os.path.join(LOG_DIR, f"edge_tts_{uuid.uuid4().hex}.mp3")
+        try:
+            edge_tts.Communicate(
+                text=text,
+                voice=self.voice,
+                rate=self.rate,
+            ).save_sync(temp_path)
+            audio, sr = sf.read(temp_path, dtype="float32")
+            if audio.ndim > 1:
+                audio = audio[:, 0]
+            audio = np.asarray(audio, dtype=np.float32).flatten()
+            logger.info(
+                f"TTS: 极速合成完成, 耗时={time.perf_counter() - started_at:.2f}s, "
+                f"音频={len(audio) / sr:.1f}s"
+            )
+            return audio, int(sr)
+        except Exception:
+            logger.error(f"TTS 极速合成异常: {traceback.format_exc()}")
+            return None, 0
+        finally:
+            try:
+                if os.path.isfile(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
+
+    def update_ref_audio(self, new_ref_path: str):
+        logger.info("TTS: 极速模式不使用参考音频；Qwen 克隆模式仍保留该文件")
 
 class TTSEngine:
     """
@@ -569,6 +704,9 @@ class TTSEngine:
         self.model = None
         self.processor = None
         self.ref_wav = TTS_REF_WAV
+        self.voice_clone_prompt = None
+        self._backchannel_audio = None
+        self._backchannel_lock = threading.Lock()
         self._init_model()
 
     def _init_model(self):
@@ -588,16 +726,29 @@ class TTSEngine:
                 model_path,
                 device_map="cuda:0",
                 dtype=torch.bfloat16,
+                attn_implementation=QWEN_ATTN_IMPLEMENTATION,
                 local_files_only=True,
             )
             self.processor = None  # qwen-tts 不需要独立的 processor
-            logger.info("TTS: 模型加载完成（qwen-tts）")
+            self._refresh_voice_clone_prompt()
+            logger.info(f"TTS: 模型加载完成（qwen-tts, attention={QWEN_ATTN_IMPLEMENTATION}）")
 
         except Exception as e:
             logger.error(f"TTS 模型初始化失败: {e}")
             logger.error(traceback.format_exc())
             self.model = None
             self.processor = None
+
+    def _refresh_voice_clone_prompt(self):
+        """Cache the reference voice embedding instead of rebuilding it per sentence."""
+        if self.model is None or not os.path.isfile(self.ref_wav):
+            self.voice_clone_prompt = None
+            return
+        self.voice_clone_prompt = self.model.create_voice_clone_prompt(
+            ref_audio=self.ref_wav,
+            x_vector_only_mode=True,
+        )
+        logger.info("TTS: 音色特征缓存完成")
 
     def load_ref_audio(self, ref_path: str) -> Optional[np.ndarray]:
         """加载参考音频"""
@@ -620,6 +771,9 @@ class TTSEngine:
         返回: (audio_data, sample_rate) 或 (None, 0) 表示失败
         SEC-03: 通过 Python API 调用，不使用 shell 命令。
         """
+        text = normalize_tts_text(text)
+        if not text:
+            return None, 0
         ref_path = ref_wav_path or self.ref_wav
 
         if not os.path.isfile(ref_path):
@@ -643,12 +797,16 @@ class TTSEngine:
             logger.info(f"TTS: 合成 '{text[:50]}...' (ref={ref_path})")
 
             # Qwen3-TTS base model: voice cloning
-            wavs, sr = self.model.generate_voice_clone(
-                text=text,
-                language="Chinese",
-                ref_audio=ref_path,
-                x_vector_only_mode=True,  # 只用音色向量，不需要参考文本
-            )
+            generate_kwargs = {
+                "text": text,
+                "language": "Chinese",
+            }
+            if ref_path == self.ref_wav and self.voice_clone_prompt is not None:
+                generate_kwargs["voice_clone_prompt"] = self.voice_clone_prompt
+            else:
+                generate_kwargs["ref_audio"] = ref_path
+                generate_kwargs["x_vector_only_mode"] = True
+            wavs, sr = self.model.generate_voice_clone(**generate_kwargs)
 
             audio = wavs[0] if isinstance(wavs, list) else wavs
             audio = np.asarray(audio, dtype=np.float32).flatten()
@@ -663,22 +821,288 @@ class TTSEngine:
     def update_ref_audio(self, new_ref_path: str):
         """更新参考音频路径"""
         self.ref_wav = new_ref_path
+        self._refresh_voice_clone_prompt()
         logger.info(f"参考音频已更新: {new_ref_path}")
+
+    def prepare_backchannel(self):
+        """预生成一条克隆音色的短回声，避免用户等待时完全无反馈。"""
+        if self.model is None or self._backchannel_audio is not None:
+            return
+        with self._backchannel_lock:
+            if self._backchannel_audio is not None:
+                return
+            # 只做极短的即时反馈；真正的语义回复仍由后续流式克隆 TTS 生成。
+            audio, sr = self.synthesize("嗯。")
+            if audio is not None and sr > 0:
+                self._backchannel_audio = (audio, sr)
+                logger.info("TTS: 克隆音色即时回声已预热")
+
+    def get_backchannel(self):
+        if self._backchannel_audio is None:
+            return None
+        audio, sr = self._backchannel_audio
+        return np.copy(audio), sr
 
 
 # 全局 TTS 引擎（懒加载，阶段 2 才需要）
 # 注意：不在模块导入时初始化，避免 CUDA 模型加载卡死启动。
 # 首次语音合成时通过 _get_tts() 按需加载。
 tts_engine = None
+class CosyVoiceTTSEngine:
+    """Local streaming zero-shot voice cloning with a cached speaker prompt."""
+
+    def __init__(self):
+        self.model = None
+        self.ref_wav = TTS_REF_WAV
+        self.voice_id = "chat-companion-cloned-voice"
+        self._backchannel_audio = None
+        self._backchannel_lock = threading.Lock()
+        self._inference_lock = threading.Lock()
+        self._init_model()
+
+    @staticmethod
+    def _load_wav_compat(wav, target_sr, min_sr=16000):
+        """Use soundfile directly to avoid TorchCodec/torchaudio drift."""
+        import soundfile as sf
+        import torch
+        import librosa
+
+        audio, sample_rate = sf.read(wav, dtype="float32")
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        if sample_rate != target_sr:
+            if sample_rate < min_sr:
+                raise ValueError(
+                    f"wav sample rate {sample_rate} must be at least {min_sr}"
+                )
+            audio = librosa.resample(
+                audio,
+                orig_sr=sample_rate,
+                target_sr=target_sr,
+            )
+        return torch.from_numpy(np.asarray(audio, dtype=np.float32)).unsqueeze(0)
+
+    def _init_model(self):
+        try:
+            if not os.path.isdir(COSYVOICE_MODEL_PATH):
+                logger.warning(f"CosyVoice model path not found: {COSYVOICE_MODEL_PATH}")
+                return
+            if not os.path.isdir(COSYVOICE_REPO):
+                logger.warning(f"CosyVoice repo not found: {COSYVOICE_REPO}")
+                return
+
+            matcha_path = os.path.join(COSYVOICE_REPO, "third_party", "Matcha-TTS")
+            for import_path in (matcha_path, COSYVOICE_REPO):
+                if import_path not in sys.path:
+                    sys.path.insert(0, import_path)
+
+            from cosyvoice.cli.cosyvoice import AutoModel
+            import cosyvoice.cli.frontend as frontend
+            frontend.load_wav = self._load_wav_compat
+            self.model = AutoModel(
+                model_dir=COSYVOICE_MODEL_PATH,
+                fp16=COSYVOICE_FP16,
+            )
+
+            # CosyVoice3's default first streaming block is conservative. A
+            # smaller hop lets the cloned voice begin sooner while preserving
+            # the same cached speaker embedding and inference session.
+            if (
+                COSYVOICE_STREAM_HOP_TOKENS > 0
+                and self.model.__class__.__name__ == "CosyVoice3"
+                and hasattr(self.model, "model")
+                and hasattr(self.model.model, "token_hop_len")
+            ):
+                hop = max(10, COSYVOICE_STREAM_HOP_TOKENS)
+                self.model.model.token_hop_len = hop
+                if hasattr(self.model.model, "token_max_hop_len"):
+                    self.model.model.token_max_hop_len = max(hop * 2, hop)
+                logger.info("TTS: CosyVoice 首块 token hop=%d", hop)
+
+            if not os.path.isfile(self.ref_wav):
+                logger.warning(f"CosyVoice reference audio not found: {self.ref_wav}")
+                self.model = None
+                return
+
+            # Extract speaker features once. Every sentence and bi-stream turn
+            # reuses this ID. CosyVoice3 requires the instruction terminator in
+            # the cached prompt; CosyVoice2 does not.
+            self.prompt_text = TTS_REF_TEXT
+            if self.model.__class__.__name__ == "CosyVoice3" and "<|endofprompt|>" not in self.prompt_text:
+                self.prompt_text = (
+                    "You are a helpful assistant.<|endofprompt|>"
+                    + self.prompt_text
+                )
+            self.model.add_zero_shot_spk(self.prompt_text, self.ref_wav, self.voice_id)
+            logger.info(
+                "TTS: CosyVoice streaming clone ready "
+                f"(model={COSYVOICE_MODEL_PATH}, fp16={COSYVOICE_FP16})"
+            )
+        except Exception:
+            logger.error(f"CosyVoice TTS init failed: {traceback.format_exc()}")
+            self.model = None
+
+    def stream_synthesize(
+        self,
+        text: str,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Generator[Tuple[np.ndarray, int], None, None]:
+        text = normalize_tts_text(text)
+        if not text or self.model is None:
+            return
+        if cancel_event and cancel_event.is_set():
+            return
+
+        started_at = time.perf_counter()
+        first_chunk = True
+        with self._inference_lock:
+            try:
+                stream = self.model.inference_zero_shot(
+                    text,
+                    "",
+                    "",
+                    zero_shot_spk_id=self.voice_id,
+                    stream=True,
+                    text_frontend=False,
+                )
+                for item in stream:
+                    if cancel_event and cancel_event.is_set():
+                        return
+                    audio = item.get("tts_speech")
+                    if audio is None:
+                        continue
+                    if hasattr(audio, "detach"):
+                        audio = audio.detach().cpu().numpy()
+                    audio = np.asarray(audio, dtype=np.float32).flatten()
+                    if not len(audio):
+                        continue
+                    if first_chunk:
+                        logger.info(
+                            "TTS: CosyVoice 首包 %.2fs, %.2fs 音频",
+                            time.perf_counter() - started_at,
+                            len(audio) / self.model.sample_rate,
+                        )
+                        first_chunk = False
+                    yield audio, int(self.model.sample_rate)
+            except Exception:
+                logger.error(f"CosyVoice TTS synthesis failed: {traceback.format_exc()}")
+
+    def stream_text_synthesize(
+        self,
+        text_source,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Generator[Tuple[np.ndarray, int], None, None]:
+        """Keep one cloned-voice session open while LLM text arrives incrementally."""
+        if self.model is None or cancel_event and cancel_event.is_set():
+            return
+
+        started_at = time.perf_counter()
+        first_chunk = True
+        with self._inference_lock:
+            try:
+                stream = self.model.inference_zero_shot(
+                    text_source,
+                    "",
+                    "",
+                    zero_shot_spk_id=self.voice_id,
+                    stream=True,
+                    text_frontend=False,
+                )
+                for item in stream:
+                    if cancel_event and cancel_event.is_set():
+                        return
+                    audio = item.get("tts_speech")
+                    if audio is None:
+                        continue
+                    if hasattr(audio, "detach"):
+                        audio = audio.detach().cpu().numpy()
+                    audio = np.asarray(audio, dtype=np.float32).flatten()
+                    if not len(audio):
+                        continue
+                    if first_chunk:
+                        logger.info(
+                            "TTS: CosyVoice bi-stream 首包 %.2fs, %.2fs 音频",
+                            time.perf_counter() - started_at,
+                            len(audio) / self.model.sample_rate,
+                        )
+                        first_chunk = False
+                    yield audio, int(self.model.sample_rate)
+            except Exception:
+                logger.error(
+                    f"CosyVoice bi-stream TTS synthesis failed: {traceback.format_exc()}"
+                )
+
+    def synthesize(
+        self,
+        text: str,
+        ref_wav_path: Optional[str] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Tuple[Optional[np.ndarray], int]:
+        if ref_wav_path and ref_wav_path != self.ref_wav:
+            self.update_ref_audio(ref_wav_path)
+        chunks = []
+        sample_rate = 0
+        for audio, sr in self.stream_synthesize(text, cancel_event):
+            chunks.append(audio)
+            sample_rate = sr
+        if not chunks or not sample_rate:
+            return None, 0
+        audio = np.concatenate(chunks).astype(np.float32, copy=False)
+        logger.info(
+            "TTS: CosyVoice 合成完成 %d samples @ %dHz (%.1fs)",
+            len(audio),
+            sample_rate,
+            len(audio) / sample_rate,
+        )
+        return audio, sample_rate
+
+    def prepare_backchannel(self):
+        if self.model is None or self._backchannel_audio is not None:
+            return
+        with self._backchannel_lock:
+            if self._backchannel_audio is not None:
+                return
+            # Keep the immediate acknowledgement short; semantic speech follows
+            # through the bi-stream path and must not be mistaken for the reply.
+            audio, sr = self.synthesize("嗯。")
+            if audio is not None and sr > 0:
+                self._backchannel_audio = (audio, sr)
+                logger.info("TTS: CosyVoice 克隆音色即时回声已预热")
+
+    def get_backchannel(self):
+        if self._backchannel_audio is None:
+            return None
+        audio, sr = self._backchannel_audio
+        return np.copy(audio), sr
+
+    def update_ref_audio(self, new_ref_path: str):
+        if self.model is None or not os.path.isfile(new_ref_path):
+            return
+        with self._inference_lock:
+            self.ref_wav = new_ref_path
+            self.model.add_zero_shot_spk(self.prompt_text, self.ref_wav, self.voice_id)
+            self._backchannel_audio = None
+        logger.info(f"CosyVoice 克隆音色参考音频已更新: {new_ref_path}")
+
+
+_tts_init_lock = threading.Lock()
 
 def _get_tts():
     """懒加载 TTS 引擎"""
     global tts_engine
     if tts_engine is None:
-        try:
-            tts_engine = TTSEngine()
-        except Exception as e:
-            logger.warning(f"TTS 引擎未加载（阶段 2 功能，不影响文字聊天）: {e}")
+        with _tts_init_lock:
+            if tts_engine is None:
+                try:
+                    if TTS_BACKEND == "edge":
+                        tts_engine = EdgeTTSEngine()
+                    elif TTS_BACKEND == "cosyvoice":
+                        tts_engine = CosyVoiceTTSEngine()
+                    else:
+                        tts_engine = TTSEngine()
+                except Exception as e:
+                    logger.warning(f"TTS 引擎未加载（阶段 2 功能，不影响文字聊天）: {e}")
     return tts_engine
 
 
@@ -817,16 +1241,36 @@ def forward_audio_to_avatar(audio_data: np.ndarray, sample_rate: int = 16000,
         # 直发 LiveTalking /humanaudio（sessionid=0）
         url = f"{LIVETALKING_URL}/humanaudio"
         logger.info(f"口型驱动: 转发 {wav_buffer.tell()} 字节音频 -> {url}")
-        resp = requests.post(url,
-            files={"file": ("tts.wav", wav_buffer.getvalue(), "audio/wav")},
-            data={"sessionid": "0"},
-            timeout=5.0)
-        ok = resp.status_code == 200
-        if ok:
-            logger.info(f"口型驱动: 转发成功 -> {resp.json()}")
-        else:
-            logger.warning(f"口型驱动: 转发失败 HTTP {resp.status_code}: {resp.text[:200]}")
-        return ok
+        payload_bytes = wav_buffer.getvalue()
+        # Do not hold the LLM/TTS generator for several seconds while an
+        # iframe is reconnecting. A later sentence can retry after the WebRTC
+        # session is ready; the first feedback sound must stay second-level.
+        retry_delays = (0.08, 0.18, 0.35)
+        for attempt, retry_delay in enumerate(retry_delays):
+            resp = requests.post(
+                url,
+                files={"file": ("tts.wav", payload_bytes, "audio/wav")},
+                data={"sessionid": "0"},
+                timeout=5.0,
+            )
+            try:
+                result = resp.json()
+            except ValueError:
+                result = {"code": resp.status_code, "msg": resp.text[:200]}
+            ok = resp.status_code == 200 and result.get("code", 0) == 0
+            if ok:
+                logger.info(f"口型驱动: 转发成功 -> {result}")
+                return True
+            logger.warning(
+                f"口型驱动: 转发失败 HTTP {resp.status_code}: {result} "
+                f"(第{attempt + 1}/{len(retry_delays)}次)"
+            )
+            if result.get("msg") != "session not found" or attempt >= len(retry_delays) - 1:
+                break
+            # The iframe may be recreating its WebRTC session; give it a short
+            # window before dropping this sentence's mouth-driving request.
+            time.sleep(retry_delay)
+        return False
     except requests.ConnectionError:
         logger.warning("口型驱动: LiveTalking 不可达，跳过")
         return False
@@ -845,9 +1289,23 @@ class ConversationPipeline:
     def __init__(self):
         self.vad = VADDetector()
         self.history: List[dict] = [
-            {"role": "system", "content": "你是一个友善、体贴的AI语音助手，说话温柔自然，用中文回复。回复简洁、口语化，适合语音朗读。"}
+            {"role": "system", "content": "你是一个友善、体贴的AI语音助手，说话温柔自然，用中文回复。回复自然、有陪伴感、口语化，适合语音朗读；根据用户需要决定回复长度，不要为了语音合成而刻意缩短内容。"}
         ]
         self._audio_segments: List[tuple] = []  # 累积 (audio_np, sample_rate) 用于最后一次性送口型
+
+    def _backchannel_event(self):
+        """返回已预热的克隆音色短回声，避免用户等待时完全无反馈。"""
+        if not TTS_BACKCHANNEL_ENABLED:
+            return None
+        engine = _get_tts()
+        if engine is None or not hasattr(engine, "get_backchannel"):
+            return None
+        cached = engine.get_backchannel()
+        if cached is None:
+            return None
+        audio, sr = cached
+        self._audio_segments.append((audio, sr))
+        return {"type": "audio", "data": (sr, (audio * 32767).astype(np.int16))}
 
     def process_voice(self, audio_data: np.ndarray, sample_rate: int = 16000) -> Generator[dict, None, None]:
         """
@@ -879,51 +1337,48 @@ class ConversationPipeline:
         yield {"type": "transcription", "text": user_text}
         self.history.append({"role": "user", "content": user_text})
 
+        backchannel = self._backchannel_event()
+        if backchannel:
+            yield backchannel
+
         # ---- LLM 流式回复 ----
         yield {"type": "status", "state": "thinking", "text": "思考中..."}
 
-        full_reply = ""
-        sentence_buffer = ""
         cancel = state_machine.cancel_event
 
-        try:
-            for token in llm_client.stream_chat(self.history, cancel):
-                if cancel.is_set():
-                    break
-                full_reply += token
-                sentence_buffer += token
-
-                # 按自然停顿拆句，尽早送 TTS
-                split_point = re.search(r'[。！？\n!?]', sentence_buffer)
-                if split_point:
-                    sentence = sentence_buffer[:split_point.end()].strip()
-                    sentence_buffer = sentence_buffer[split_point.end():]
-
-                    if sentence:
-                        yield {"type": "reply_token", "text": sentence}
-                        # 送 TTS 并分发
-                        audio_result = yield from self._synthesize_and_dispatch(
+        cosyvoice = _get_tts() if TTS_BACKEND == "cosyvoice" else None
+        if cosyvoice is not None and hasattr(cosyvoice, "stream_text_synthesize"):
+            full_reply = yield from self._stream_cosyvoice_reply(session_id, cancel)
+        else:
+            full_reply = ""
+            tts_pending = ""
+            try:
+                for token in llm_client.stream_chat(self.history, cancel):
+                    if cancel.is_set():
+                        break
+                    full_reply += token
+                    yield {"type": "reply_token", "text": token}
+                    tts_pending += token
+                    tts_units, tts_pending = pop_tts_units(tts_pending)
+                    for sentence in tts_units:
+                        if cancel.is_set():
+                            break
+                        yield from self._synthesize_and_dispatch(
                             sentence, session_id, cancel
                         )
-                        if audio_result:
-                            yield audio_result
-                else:
-                    yield {"type": "reply_token", "text": token}
 
-            # 处理剩余文本
-            if sentence_buffer.strip() and not cancel.is_set():
-                final_sentence = sentence_buffer.strip()
-                yield {"type": "reply_token", "text": final_sentence}
-                audio_result = yield from self._synthesize_and_dispatch(
-                    final_sentence, session_id, cancel
-                )
-                if audio_result:
-                    yield audio_result
-
-        except PipelineError as e:
-            state_machine.transition(AvatarState.IDLE)
-            yield {"type": "error", "error": e.to_dict()["error"]}
-            return
+                if tts_pending.strip() and not cancel.is_set():
+                    speech_units, tts_pending = pop_tts_units(tts_pending, final=True)
+                    for sentence in speech_units:
+                        if cancel.is_set():
+                            break
+                        yield from self._synthesize_and_dispatch(
+                            sentence, session_id, cancel
+                        )
+            except PipelineError as e:
+                state_machine.transition(AvatarState.IDLE)
+                yield {"type": "error", "error": e.to_dict()["error"]}
+                return
 
         # ---- 保存到历史 ----
         if not cancel.is_set():
@@ -947,32 +1402,53 @@ class ConversationPipeline:
         self.history.append({"role": "user", "content": text})
         yield {"type": "transcription", "text": text}
 
-        full_reply = ""
+        backchannel = self._backchannel_event()
+        if backchannel:
+            yield backchannel
+
         cancel = state_machine.cancel_event
 
-        try:
-            for token in llm_client.stream_chat(self.history, cancel):
-                if cancel.is_set():
-                    break
-                full_reply += token
-                yield {"type": "reply_token", "text": token}
+        cosyvoice = _get_tts() if TTS_BACKEND == "cosyvoice" else None
+        if cosyvoice is not None and hasattr(cosyvoice, "stream_text_synthesize"):
+            full_reply = yield from self._stream_cosyvoice_reply(session_id, cancel)
+        else:
+            full_reply = ""
+            tts_pending = ""
+            try:
+                for token in llm_client.stream_chat(self.history, cancel):
+                    if cancel.is_set():
+                        break
+                    full_reply += token
+                    yield {"type": "reply_token", "text": token}
 
-        except PipelineError as e:
-            state_machine.transition(AvatarState.IDLE)
-            yield {"type": "error", "error": e.to_dict()["error"]}
-            return
+                    if TTS_BACKEND != "edge":
+                        tts_pending += token
+                        tts_units, tts_pending = pop_tts_units(tts_pending)
+                        for sentence in tts_units:
+                            if cancel.is_set():
+                                break
+                            yield from self._synthesize_and_dispatch(
+                                sentence, session_id, cancel
+                            )
 
-        # 完整回复送 TTS
-        if full_reply.strip() and not cancel.is_set():
-            # 拆句逐句合成
-            for sentence in split_sentences(full_reply):
-                if cancel.is_set():
-                    break
-                audio_result = yield from self._synthesize_and_dispatch(
-                    sentence, session_id, cancel
-                )
-                if audio_result:
-                    yield audio_result
+            except PipelineError as e:
+                state_machine.transition(AvatarState.IDLE)
+                yield {"type": "error", "error": e.to_dict()["error"]}
+                return
+
+            if full_reply.strip() and not cancel.is_set():
+                if TTS_BACKEND == "edge":
+                    speech_units = [full_reply.strip()]
+                else:
+                    speech_units, tts_pending = pop_tts_units(
+                        tts_pending, final=True
+                    )
+                for sentence in speech_units:
+                    if cancel.is_set():
+                        break
+                    yield from self._synthesize_and_dispatch(
+                        sentence, session_id, cancel
+                    )
 
         if not cancel.is_set():
             self.history.append({"role": "assistant", "content": full_reply})
@@ -980,7 +1456,6 @@ class ConversationPipeline:
                 self.history = [self.history[0]] + self.history[-40:]
 
         state_machine.transition(AvatarState.IDLE)
-        self._flush_avatar_audio()
         yield {"type": "status", "state": "idle", "text": "待机"}
 
     def _synthesize_and_dispatch(self, text: str, session_id: str,
@@ -993,8 +1468,18 @@ class ConversationPipeline:
         yield {"type": "status", "state": "speaking", "text": "说话中..."}
 
         try:
-            if _get_tts() is not None:
-                audio, sr = _get_tts().synthesize(text, cancel_event=cancel_event)
+            engine = _get_tts()
+            if engine is not None and hasattr(engine, "stream_synthesize"):
+                for audio, sr in engine.stream_synthesize(text, cancel_event):
+                    if cancel_event.is_set():
+                        return
+                    self._audio_segments.append((audio, sr))
+                    audio_int16 = (audio * 32767).astype(np.int16)
+                    yield {"type": "audio", "data": (sr, audio_int16)}
+                return
+
+            if engine is not None:
+                audio, sr = engine.synthesize(text, cancel_event=cancel_event)
             else:
                 audio, sr = None, 0
 
@@ -1002,13 +1487,16 @@ class ConversationPipeline:
                 return
 
             if audio is not None and sr > 0:
+                # Put the segment into the avatar buffer before yielding the
+                # browser event. The UI handler flushes the buffer immediately
+                # after it receives the event; appending after yield would make
+                # a one-sentence reply play audio without moving the mouth.
+                self._audio_segments.append((audio, sr))
+                logger.info(f"口型驱动: 累积音频 {len(audio)} 采样点 (第{len(self._audio_segments)}段)")
+
                 # 路径A: 回传浏览器播放
                 audio_int16 = (audio * 32767).astype(np.int16)
                 yield {"type": "audio", "data": (sr, audio_int16)}
-
-                # 累积音频，等全部合成完一次性送 /humanaudio（保证口型连续）
-                self._audio_segments.append((audio, sr))
-                logger.info(f"口型驱动: 累积音频 {len(audio)} 采样点 (第{len(self._audio_segments)}段)")
 
         except Exception as e:
             logger.error(f"TTS 分发异常: {traceback.format_exc()}")
@@ -1017,39 +1505,151 @@ class ConversationPipeline:
                 "message": "语音合成失败，仅显示文字回复"
             }}
 
+    def _stream_cosyvoice_reply(
+        self,
+        session_id: str,
+        cancel_event: threading.Event,
+    ) -> Generator[dict, None, str]:
+        """Run one LLM->CosyVoice bi-stream without restarting TTS per sentence."""
+        engine = _get_tts()
+        if engine is None or not hasattr(engine, "stream_text_synthesize"):
+            return ""
+
+        text_queue = queue.Queue()
+        event_queue = queue.Queue()
+        end_marker = object()
+        full_reply = []
+        llm_done = threading.Event()
+        tts_done = threading.Event()
+
+        def text_source():
+            while not cancel_event.is_set():
+                chunk = text_queue.get()
+                if chunk is end_marker:
+                    return
+                if chunk:
+                    yield chunk
+
+        def llm_worker():
+            try:
+                for token in llm_client.stream_chat(self.history, cancel_event):
+                    if cancel_event.is_set():
+                        break
+                    full_reply.append(token)
+                    event_queue.put({"type": "reply_token", "text": token})
+                    text_queue.put(token)
+            except PipelineError as exc:
+                event_queue.put({"type": "error", "error": exc.to_dict()["error"]})
+            except Exception:
+                logger.error(f"LLM bi-stream 异常: {traceback.format_exc()}")
+                event_queue.put({
+                    "type": "error",
+                    "error": {
+                        "code": "LLM_ERR_003",
+                        "message": "大模型回复超时，请重试",
+                    },
+                })
+            finally:
+                text_queue.put(end_marker)
+                llm_done.set()
+
+        def tts_worker():
+            try:
+                for audio, sr in engine.stream_text_synthesize(
+                    text_source(), cancel_event
+                ):
+                    event_queue.put({
+                        "type": "audio",
+                        "data": (sr, (audio * 32767).astype(np.int16)),
+                    })
+            except Exception:
+                logger.error(f"TTS bi-stream 异常: {traceback.format_exc()}")
+                event_queue.put({
+                    "type": "error",
+                    "error": {
+                        "code": "TTS_ERR_001",
+                        "message": "语音合成失败，仅显示文字回复",
+                    },
+                })
+            finally:
+                tts_done.set()
+
+        llm_thread = threading.Thread(target=llm_worker, daemon=True)
+        tts_thread = threading.Thread(target=tts_worker, daemon=True)
+        llm_thread.start()
+        tts_thread.start()
+
+        speaking_started = False
+        while not (llm_done.is_set() and tts_done.is_set() and event_queue.empty()):
+            try:
+                event = event_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if event["type"] == "audio":
+                sr, audio_data = event["data"]
+                audio_f32 = audio_data.astype(np.float32) / 32767.0
+                self._audio_segments.append((audio_f32, sr))
+                if not speaking_started:
+                    state_machine.transition(AvatarState.SPEAKING)
+                    speaking_started = True
+                    yield {"type": "status", "state": "speaking", "text": "说话中..."}
+                yield event
+            else:
+                yield event
+
+        llm_thread.join(timeout=0.2)
+        tts_thread.join(timeout=0.2)
+        return "".join(full_reply)
+
     def stop(self):
         """停止/打断"""
         state_machine.transition(AvatarState.IDLE)
         logger.info("用户触发停止/打断")
 
-    def _flush_avatar_audio(self):
-        """拼接所有累积的 TTS 音频段，一次性发送到 LiveTalking /humanaudio 驱动口型。"""
+    def _flush_avatar_audio(self, delay_sec: float = 0.0,
+                            background: bool = True):
+        """发送已累积的 TTS 片段到 LiveTalking 驱动口型。
+
+        文本分段播放使用同步路径，避免下一次 GPU 合成抢在对应的口型请求
+        之前开始；语音输入仍使用后台路径，保持原有流程。
+        """
         if not self._audio_segments:
-            return
+            return False
         try:
             # 拼接所有音频段
             all_audio = np.concatenate([seg for seg, _ in self._audio_segments])
             sr = self._audio_segments[0][1]  # 所有段用同一个采样率
 
-            # RMS 归一化到 -10dBFS，保证口型明显（wav2lip 对音量极其敏感）
+            # RMS 归一化到约 -10dBFS，保证口型明显（wav2lip 对音量极其敏感）。
+            # 近乎静音的流式尾段不能按 RMS 无限放大，否则会把编码底噪放大成爆音。
             rms = float(np.sqrt(np.mean(all_audio.astype(np.float64) ** 2)))
+            peak = float(np.max(np.abs(all_audio))) if len(all_audio) else 0.0
             target_rms = 0.316  # -10dBFS
-            if rms > 0.0001:
-                gain = target_rms / rms
+            if rms < 0.008:
+                gain = 1.0
             else:
-                gain = 4.0  # 静音兜底
+                desired_gain = target_rms / rms
+                peak_safe_gain = 0.95 / max(peak, 1e-6)
+                gain = min(desired_gain, peak_safe_gain, 4.0)
             all_audio = np.clip(all_audio * gain, -1.0, 1.0).astype(np.float32)
 
             total_sec = len(all_audio) / sr
             logger.info(f"口型驱动: 发送完整音频 {len(all_audio)}样本 @ {sr}Hz ({total_sec:.1f}s) "
-                        f"原始RMS={rms:.4f} → 增益={gain:.1f}x ({20*np.log10(gain):.0f}dB)")
-            threading.Thread(
-                target=forward_audio_to_avatar,
-                args=(all_audio, sr, "0"),
-                daemon=True,
-            ).start()
+                        f"原始RMS={rms:.4f}, 峰值={peak:.4f} → 增益={gain:.1f}x "
+                        f"({20*np.log10(max(gain, 1e-6)):.0f}dB)")
+            def dispatch_avatar_audio():
+                if delay_sec > 0:
+                    time.sleep(delay_sec)
+                return forward_audio_to_avatar(all_audio, sr, "0")
+
+            if background:
+                threading.Thread(target=dispatch_avatar_audio, daemon=True).start()
+                return None
+            else:
+                return dispatch_avatar_audio()
         except Exception as e:
             logger.error(f"口型驱动: 拼接/转发失败 - {e}")
+            return False
         finally:
             self._audio_segments = []
 
@@ -1183,11 +1783,11 @@ def create_ui():
         bottom: 0 !important;
         left: auto !important;
         margin: 0 !important;
-        width: 58vw !important;
+        width: 40vw !important;
         height: 100vh !important;
         z-index: 1 !important;
-        -webkit-mask-image: linear-gradient(90deg, transparent 0%, rgba(0,0,0,.55) 16%, #000 36%, #000 100%) !important;
-        mask-image: linear-gradient(90deg, transparent 0%, rgba(0,0,0,.55) 16%, #000 36%, #000 100%) !important;
+        -webkit-mask-image: linear-gradient(90deg, transparent 0%, rgba(0,0,0,.65) 12%, #000 28%, #000 100%) !important;
+        mask-image: linear-gradient(90deg, transparent 0%, rgba(0,0,0,.65) 12%, #000 28%, #000 100%) !important;
     }
     .right-zone > *,
     .right-zone > * > *,
@@ -1203,6 +1803,25 @@ def create_ui():
         filter: saturate(0.92) contrast(1.02) brightness(0.90) !important;
     }
     .avatar-shell { position: relative; width: 100%; height: 100%; min-height: 240px; background: transparent; }
+    .avatar-shell::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        z-index: 3;
+        pointer-events: none;
+        opacity: 0;
+        background: radial-gradient(ellipse at 52% 66%, rgba(139,92,246,.18), transparent 34%);
+        box-shadow: inset 0 0 80px rgba(124,58,237,.08);
+        transition: opacity 220ms ease-out;
+    }
+    .avatar-shell.is-speaking::after {
+        opacity: .62;
+        animation: avatar-speaking-pulse 1.6s ease-in-out infinite;
+    }
+    @keyframes avatar-speaking-pulse {
+        0%, 100% { opacity: .32; }
+        50% { opacity: .72; }
+    }
     .avatar-fallback { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: #94A3B8; font-size: 13px; text-align: center; }
     .avatar-fallback-mark { width: 72px; height: 72px; border-radius: 50%; background: radial-gradient(circle at 35% 30%, #A78BFA, #312E81 58%, #0F172A 100%); box-shadow: 0 0 48px rgba(124,58,237,.28); }
     .avatar-fallback-title { color: #CBD5E1; font-size: 16px; }
@@ -1340,6 +1959,22 @@ def create_ui():
         transform: scale(0.95) !important;
         transition: all 100ms ease-out !important;
     }
+    .voice-ball-btn.is-recording {
+        color: #FBCFE8 !important;
+        background: radial-gradient(circle at 40% 35%,
+            rgba(236,72,153,0.36) 0%,
+            rgba(124,58,237,0.18) 46%,
+            rgba(15,23,42,0.92) 100%) !important;
+        box-shadow:
+            0 0 70px rgba(236,72,153,0.28),
+            0 0 140px rgba(124,58,237,0.12),
+            inset 0 1px 0 rgba(255,255,255,0.08) !important;
+        animation: voice-recording-pulse 1.15s ease-in-out infinite !important;
+    }
+    @keyframes voice-recording-pulse {
+        0%, 100% { transform: scale(1); }
+        50% { transform: scale(1.045); }
+    }
     .voice-ball-btn:focus-visible {
         outline: 2px solid #7C3AED !important;
         outline-offset: 6px !important;
@@ -1460,33 +2095,48 @@ def create_ui():
     }
     """
 
+    audio_unlock_js = """
+    () => {
+        let audioReady = false;
+        let audioContext = null;
+
+        const notifyAvatar = () => {
+            const frame = document.querySelector('.avatar-shell iframe');
+            if (frame && frame.contentWindow && audioReady) {
+                frame.contentWindow.postMessage({ type: 'enable-audio' }, '*');
+            }
+        };
+
+        const unlockAudio = () => {
+            if (!audioReady) {
+                const AudioContext = window.AudioContext || window.webkitAudioContext;
+                if (AudioContext) {
+                    audioContext = audioContext || new AudioContext();
+                    audioContext.resume().catch(() => {});
+                }
+                audioReady = true;
+            }
+            notifyAvatar();
+        };
+
+        document.addEventListener('pointerdown', unlockAudio, { capture: true });
+        document.addEventListener('keydown', unlockAudio, { capture: true });
+        window.setInterval(notifyAvatar, 1000);
+    }
+    """
+
     with gr.Blocks(
         title="AI 语音伴侣",
         theme=theme,
         css=custom_css,
         analytics_enabled=False,
+        js=audio_unlock_js,
     ) as demo:
 
         # =========================================================================
         # 绕过浏览器自动播放限制的脚本
         # =========================================================================
-        audio_unlock_kwargs = {
-            "value": '<div id="audio-unlock" style="display:none"></div>',
-            "visible": True,
-        }
-        if "js_on_load" in inspect.signature(gr.HTML).parameters:
-            audio_unlock_kwargs["js_on_load"] = """
-            let audioReady = false;
-            let ctx = null;
-            document.addEventListener('click', () => {
-                if (!audioReady) {
-                    ctx = new (window.AudioContext || window.webkitAudioContext)();
-                    ctx.resume();
-                    audioReady = true;
-                }
-            }, { once: false });
-            """
-        gr.HTML(**audio_unlock_kwargs)
+        gr.HTML(value='<div id="audio-unlock" style="display:none"></div>', visible=True)
 
         # =========================================================================
         # 三区布局（无硬边框，统一暗色背景+环境光）
@@ -1542,43 +2192,31 @@ def create_ui():
             with gr.Column(scale=1, elem_classes=["right-zone"]):
                 avatar_html = f'''
                     <div class="avatar-shell" role="status" aria-live="polite">
-                        <div class="avatar-fallback">
-                            <div class="avatar-fallback-mark" aria-hidden="true"></div>
-                            <div class="avatar-fallback-title">数字人待机中...</div>
-                            <div class="avatar-fallback-sub">正在连接本地视觉服务</div>
-                        </div>
                         <iframe
-                            src="{LIVETALKING_URL.rstrip('/')}/avatar-embed.html"
+                            src="{LIVETALKING_URL.rstrip('/')}/avatar-embed.html?v=5"
                             allow="autoplay;camera;microphone"
                             title="Digital Avatar"
-                            style="display:none;width:100%;height:100%;border:none;"
+                            style="display:block;width:100%;height:100%;border:none;"
                         ></iframe>
                     </div>
                     '''
                 avatar_html_kwargs = {"value": avatar_html, "show_label": False}
-                if "js_on_load" in inspect.signature(gr.HTML).parameters:
-                    avatar_html_kwargs["js_on_load"] = f"""
-                    const shell = element.querySelector('.avatar-shell');
-                    const frame = shell?.querySelector('iframe');
-                    const fallback = shell?.querySelector('.avatar-fallback');
-                    if (shell && frame && fallback) {{
-                        fetch({json.dumps(LIVETALKING_URL.rstrip('/') + '/health')}, {{ mode: 'no-cors' }})
-                            .then(() => {{ frame.style.display = 'block'; fallback.style.display = 'none'; }})
-                            .catch(() => {{ frame.style.display = 'none'; fallback.style.display = 'flex'; }});
-                    }}
-                    """
                 avatar_video = gr.HTML(**avatar_html_kwargs)
 
         # ---- 浮动音频播放条（自动播放TTS语音） ----
         tts_audio_output = gr.Audio(
-            type="filepath", interactive=False,
-            visible=True, autoplay=True,
+            type="filepath", format="wav", interactive=False,
+            # LiveTalking's WebRTC stream is the primary synchronized audio
+            # path. Keep this component hidden for API compatibility, but do
+            # not feed it the same audio or the browser will play two copies.
+            visible=False, autoplay=True,
             elem_classes=["audio-player"],
         )
 
         # ---- 隐藏组件 ----
         audio_input = gr.Audio(
-            sources=["microphone", "upload"], type="numpy", visible=False,
+            sources=["microphone"], type="numpy", visible=False,
+            elem_id="voice-mic-recorder",
         )
         ref_audio_upload = gr.Audio(
             sources=["upload"], type="filepath", visible=False,
@@ -1600,6 +2238,40 @@ def create_ui():
             status = "思考中..."
             audio_segments = []
             audio_sr = 24000
+            progressive_audio_count = 0
+            progressive_qwen = TTS_BACKEND != "edge"
+
+            def audio_skip():
+                """Keep the current browser audio while text/status streams update."""
+                return gr.skip() if hasattr(gr, "skip") else None
+
+            def write_playback_wav(audio_data, sample_rate, sequence):
+                """Normalize one TTS unit and persist it with a unique cache path."""
+                import soundfile as sf
+
+                raw = np.asarray(audio_data).reshape(-1)
+                if np.issubdtype(raw.dtype, np.integer):
+                    audio_f32 = raw.astype(np.float32) / 32767.0
+                else:
+                    audio_f32 = raw.astype(np.float32)
+                audio_f32 = np.clip(audio_f32, -1.0, 1.0)
+                playback_rms = float(
+                    np.sqrt(np.mean(audio_f32.astype(np.float64) ** 2))
+                )
+                playback_peak = float(np.max(np.abs(audio_f32)))
+                target_rms = 0.25  # roughly -12 dBFS before peak limiting
+                desired_gain = target_rms / max(playback_rms, 1e-6)
+                peak_safe_gain = 0.95 / max(playback_peak, 1e-6)
+                playback_gain = min(desired_gain, peak_safe_gain, 4.0)
+                audio_f32 = np.clip(
+                    audio_f32 * playback_gain, -0.95, 0.95
+                ).astype(np.float32)
+                output_path = os.path.join(
+                    LOG_DIR,
+                    f"tts_chunk_{sequence}_{uuid.uuid4().hex}.wav",
+                )
+                sf.write(output_path, audio_f32, int(sample_rate))
+                return output_path, playback_gain, audio_f32
 
             def make_message(role, content):
                 """Use Gradio's native message object when the runtime provides it."""
@@ -1631,37 +2303,71 @@ def create_ui():
                     if event["type"] == "reply_token":
                         reply_text += event["text"]
                         append_reply(reply_text)
-                        yield "", new_history, status, None
+                        yield "", new_history, status, audio_skip()
                     elif event["type"] == "status":
                         status = event["text"]
+                        # The last Qwen chunk may still be playing in the browser;
+                        # keep the avatar in its speaking visual state until the
+                        # next user turn instead of clearing the audio output.
+                        if status == "待机" and progressive_audio_count:
+                            status = "播放中"
                         # Keep generator alive during TTS phase
-                        yield "", new_history, status, None
+                        yield "", new_history, status, audio_skip()
                     elif event["type"] == "error":
                         append_reply(f"错误: {event['error']['message']}")
-                        yield "", new_history, "就绪", None
+                        yield "", new_history, "就绪", audio_skip()
                         return
                     elif event["type"] == "audio":
                         sr, audio_data = event["data"]
                         if audio_data is not None and len(audio_data) > 0:
-                            audio_segments.append(audio_data)
-                            audio_sr = sr
-                            # Signal TTS progress to keep connection alive
-                            yield "", new_history, f"语音生成中 ({len(audio_segments)})...", None
+                            if progressive_qwen:
+                                progressive_audio_count += 1
+                                duration = len(audio_data) / max(sr, 1)
+                                logger.info(
+                                    f"TTS WebRTC 播放: 第{progressive_audio_count}段 "
+                                    f"{duration:.1f}s"
+                                )
+                                # WebRTC is the only browser playback path. It
+                                # carries the same PCM sent to LiveTalking and
+                                # therefore stays aligned with the mouth motion.
+                                pipeline._flush_avatar_audio(
+                                    delay_sec=0.05, background=False
+                                )
+                                yield "", new_history, "播放中", audio_skip()
+                            else:
+                                audio_segments.append(audio_data)
+                                audio_sr = sr
+                                # Signal TTS progress to keep connection alive
+                                yield "", new_history, f"语音生成中 ({len(audio_segments)})...", audio_skip()
             except Exception as e:
                 logger.error(f"文字处理异常: {traceback.format_exc()}")
                 append_reply("处理失败，请重试")
 
             ui_chat_history = new_history
 
+            # Qwen chunks have already been sent one by one. Do not yield a final
+            # empty audio update, otherwise Gradio can clear the last chunk.
+            if progressive_audio_count:
+                logger.info(
+                    f"TTS 分段播放结束: 共{progressive_audio_count}段，未限制回复长度"
+                )
+                return
+
             # 合并所有音频段，写入固定路径 WAV，返回给 Gradio
             if audio_segments:
-                import soundfile as sf
                 full_audio = np.concatenate(audio_segments)
-                full_audio_f32 = (full_audio.astype(np.float32) / 32767.0).clip(-1.0, 1.0)
-                dump_path = os.path.join(LOG_DIR, "last_tts.wav")
-                sf.write(dump_path, full_audio_f32, audio_sr)
-                logger.info(f"TTS 完成: {len(full_audio_f32)} 采样点 @ {audio_sr}Hz ({len(full_audio_f32)/audio_sr:.1f}s)")
+                dump_path, playback_gain, full_audio_f32 = write_playback_wav(
+                    full_audio, audio_sr, "full"
+                )
+                logger.info(
+                    f"TTS 完成: {len(full_audio_f32)} 采样点 @ {audio_sr}Hz "
+                    f"({len(full_audio_f32)/audio_sr:.1f}s), 播放增益={playback_gain:.2f}x "
+                    f"({20*np.log10(max(playback_gain, 1e-6)):.1f}dB)"
+                )
                 yield "", new_history, "播放中", dump_path
+                # Gradio receives the browser audio update before LiveTalking starts,
+                # keeping visible mouth motion aligned with local playback startup.
+                pipeline._flush_avatar_audio(delay_sec=0.20)
                 # 音频已送出，不再 yield None 覆盖它
                 return
 
@@ -1684,6 +2390,7 @@ def create_ui():
             status = "就绪"
             user_text = ""
             reply_text = ""
+            audio_count = 0
 
             def make_message(role, content):
                 if hasattr(gr, "ChatMessage"):
@@ -1712,6 +2419,19 @@ def create_ui():
                         yield chat_history, status, ""
                     elif event["type"] == "status":
                         status = event["text"]
+                        if status == "待机" and audio_count:
+                            status = "播放中"
+                            yield chat_history, status, ""
+                    elif event["type"] == "audio":
+                        # 语音输入链路此前漏掉了 audio 事件，导致音频只
+                        # 累积在管线里，直到整轮结束才尝试发送。现在每个
+                        # TTS 片段生成后立即送入 LiveTalking WebRTC。
+                        audio_count += 1
+                        pipeline._flush_avatar_audio(
+                            delay_sec=0.05, background=False
+                        )
+                        status = "播放中"
+                        yield chat_history, status, ""
                     elif event["type"] == "error":
                         chat_history.append(make_message("user", "(语音)"))
                         chat_history.append(make_message("assistant", f"错误: {event['error']['message']}"))
@@ -1762,17 +2482,58 @@ def create_ui():
             inputs=[text_input],
             outputs=[text_input, chatbot, status_text, tts_audio_output],
         )
+        status_text.change(
+            fn=None,
+            inputs=[status_text],
+            outputs=[],
+            js="""(status) => {
+                const shell = document.querySelector('.avatar-shell');
+                if (shell) shell.classList.toggle('is-speaking', /说话中|播放中|语音生成/.test(status || ''));
+            }""",
+        )
         stop_btn.click(
             fn=handle_stop, inputs=[], outputs=[chatbot, status_text],
         )
-        # 语音球: 触发隐藏的麦克风录制
+        # 语音球: 第一次点击开始麦克风录制，第二次点击停止并提交。
+        # 只操作 Gradio 的录音按钮，绝不能点击 file input，否则会打开文件夹。
         voice_btn.click(
             fn=None,
             inputs=[],
             outputs=[],
             js="""() => {
-                const mic = document.querySelector('input[type="file"][accept*="audio"]');
-                if (mic) mic.click();
+                const recorder = document.getElementById('voice-mic-recorder');
+                if (!recorder) {
+                    console.error('Voice recorder component is unavailable');
+                    return;
+                }
+
+                const firstVisible = (selector) => Array.from(
+                    recorder.querySelectorAll(selector)
+                ).find((button) => {
+                    const style = window.getComputedStyle(button);
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && !button.disabled;
+                });
+                const stopControl = firstVisible(
+                    'button.stop-button, button[aria-label="Stop recording"], '
+                    + 'button[aria-label="Stop audio recording"]'
+                );
+                const recordControl = firstVisible(
+                    'button.record-button, button[aria-label="Record audio"]'
+                );
+                const control = stopControl || recordControl;
+                if (!control) {
+                    console.error('Voice recorder control is unavailable');
+                    return;
+                }
+
+                control.click();
+                const voiceBall = document.querySelector('.voice-ball-btn');
+                if (voiceBall) {
+                    voiceBall.textContent = stopControl ? '语音\\n对话' : '停止\\n并发送';
+                    voiceBall.classList.toggle('is-recording', !stopControl);
+                }
             }""",
         )
         audio_input.stop_recording(
@@ -1799,8 +2560,24 @@ if __name__ == "__main__":
     logger.info(f"配置文件: {CONFIG_PATH}")
     logger.info(f"LLM 地址: {LLM_BASE_URL}")
     logger.info(f"TTS 模型: {TTS_MODEL_PATH}")
+    logger.info(f"TTS 后端: {TTS_BACKEND}")
     logger.info(f"上传目录: {UPLOAD_DIR}")
     logger.info("=" * 60)
+
+    def warm_local_models():
+        # Sequential warmup avoids loading Ollama and the 1.7B TTS model at the
+        # same time on a 16GB GPU. The short phrase is synthesized once with
+        # the cloned voice and reused as an immediate conversational backchannel.
+        engine = _get_tts()
+        if hasattr(engine, "prepare_backchannel"):
+            engine.prepare_backchannel()
+        llm_client.warmup()
+
+    threading.Thread(
+        target=warm_local_models,
+        name="local-model-preload",
+        daemon=True,
+    ).start()
 
     demo = create_ui()
 
@@ -1813,6 +2590,7 @@ if __name__ == "__main__":
         server_name="0.0.0.0",     # WSL2 需要 0.0.0.0 才能通过 localhost 访问
         server_port=7860,
         share=False,
+        allowed_paths=[LOG_DIR],
         show_error=True,  # SEC-11: True 时 Gradio 仍会显示错误，我们已在代码层捕获
         inbrowser=False,
         quiet=False,

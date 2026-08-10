@@ -106,7 +106,9 @@ MAX_RETRIES=60
 RETRY=0
 
 while [ $RETRY -lt $MAX_RETRIES ]; do
-    if curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 "http://127.0.0.1:8010/health" 2>/dev/null | grep -q '200'; then
+    # The bundled LiveTalking server does not expose /health. Its embedded
+    # avatar page is the stable readiness probe used by the web client.
+    if curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 "http://127.0.0.1:8010/avatar-embed.html" 2>/dev/null | grep -q '200'; then
         log_info "LiveTalking 就绪! 监听 http://127.0.0.1:8010"
         exit 0
     fi

@@ -41,3 +41,22 @@ completed: 2026-08-05
 | Reviewer R1 | ❌ 驳回 (正确性55) | 2026-08-05 |
 | Developer (修复) | ✅ 7 bugs 全修复 | 2026-08-05 |
 | Reviewer R2 | ✅ 通过 (90/88/87) | 2026-08-05 |
+
+## Phase 6: cloned-voice progressive playback and avatar reconnect
+
+| Stage | Owner | Result | Evidence |
+|---|---|---|---|
+| PM scope | Orchestrator | pass | Keep Qwen cloned voice, do not cap reply length, reduce first-audio wait |
+| Architecture | Architect | pass | Incremental sentence/clause TTS, cached voice prompt, same-segment mouth dispatch |
+| Developer | Developer | pass | `outputs/backend/app.py`, `scripts/avatar-embed.html`, `scripts/start-livetalking.sh` |
+| QA | QA | pass with environment warning | `outputs/qa/流式克隆音色验收报告.md` |
+| Reviewer | Reviewer | pass with environment warning | `outputs/reviewer/流式克隆音色评审报告.md` |
+
+### Phase 6 gate
+
+- Python compile and `git diff --check`: pass.
+- Gradio `:7860` and LiveTalking `:8010`: pass.
+- Browser text flow: pass; multi-segment audio output observed.
+- Mouth transport: pass; matching `humanaudio`/`put audio stream` observed.
+- Microphone browser permission: not assessed in automation because the browser context denied microphone access.
+- Qwen `1.7B` remains a non-streaming Python generation backend; the implementation reduces time-to-first-sentence but does not claim sub-second neural audio generation.
