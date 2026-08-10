@@ -1309,7 +1309,9 @@ class LiveTalkingAudioStream:
             gain = 1.0
         else:
             gain = min(0.316 / rms, 0.95 / max(peak, 1e-6), 4.0)
-        pcm = np.clip(audio_f32 * gain, -1.0, 1.0).astype("<i2")
+        # LiveTalking expects signed 16-bit PCM. Keep the normalized float
+        # signal until the final conversion, then scale it to int16 range.
+        pcm = (np.clip(audio_f32 * gain, -1.0, 1.0) * 32767.0).astype("<i2")
         try:
             self._queue.put(pcm.tobytes(), timeout=2.0)
             return True
