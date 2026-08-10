@@ -1232,67 +1232,99 @@ def forward_text_to_livetalking(text: str, session_id: str = "0") -> bool:
         return False
 
 
-def forward_audio_to_avatar(audio_data: np.ndarray, sample_rate: int = 16000,
-                             session_id: str = "") -> bool:
-    """
-    将 TTS 音频直发 LiveTalking /humanaudio，驱动 wav2lip 口型。
-    """
-    try:
-        import io
-        import wave
+class LiveTalkingAudioStream:
+    """持续向 LiveTalking 推送原始 PCM，不为每个 TTS 片段建立 HTTP 请求。"""
 
-        # float32 → int16 WAV
-        if audio_data.dtype == np.float32:
-            pcm = (audio_data * 32767).astype(np.int16)
-        else:
-            pcm = audio_data.astype(np.int16)
+    def __init__(self, base_url: str, session_id: str = "0", sample_rate: int = 48000):
+        self.url = f"{base_url.rstrip('/')}/humanaudio/stream"
+        self.session_id = session_id
+        self.sample_rate = int(sample_rate)
+        self._queue: queue.Queue[Optional[bytes]] = queue.Queue(maxsize=250)
+        self._closed = threading.Event()
+        self._failed = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="livetalking-audio-stream", daemon=True
+        )
+        self._thread.start()
 
-        wav_buffer = io.BytesIO()
-        with wave.open(wav_buffer, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(sample_rate)
-            wf.writeframes(pcm.tobytes())
+    def _body(self):
+        while True:
+            payload = self._queue.get()
+            if payload is None:
+                return
+            yield payload
 
-        # 直发 LiveTalking /humanaudio（sessionid=0）
-        url = f"{LIVETALKING_URL}/humanaudio"
-        logger.info(f"口型驱动: 转发 {wav_buffer.tell()} 字节音频 -> {url}")
-        payload_bytes = wav_buffer.getvalue()
-        # Do not hold the LLM/TTS generator for several seconds while an
-        # iframe is reconnecting. A later sentence can retry after the WebRTC
-        # session is ready; the first feedback sound must stay second-level.
-        retry_delays = (0.08, 0.18, 0.35)
-        for attempt, retry_delay in enumerate(retry_delays):
-            resp = requests.post(
-                url,
-                files={"file": ("tts.wav", payload_bytes, "audio/wav")},
-                data={"sessionid": "0"},
-                timeout=5.0,
+    def _run(self):
+        try:
+            response = requests.post(
+                self.url,
+                params={"sessionid": self.session_id},
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "X-Audio-Sample-Rate": str(self.sample_rate),
+                    "X-Audio-Format": "pcm_s16le_mono",
+                },
+                data=self._body(),
+                timeout=(5.0, None),
             )
             try:
-                result = resp.json()
+                result = response.json()
             except ValueError:
-                result = {"code": resp.status_code, "msg": resp.text[:200]}
-            ok = resp.status_code == 200 and result.get("code", 0) == 0
-            if ok:
-                logger.info(f"口型驱动: 转发成功 -> {result}")
-                return True
-            logger.warning(
-                f"口型驱动: 转发失败 HTTP {resp.status_code}: {result} "
-                f"(第{attempt + 1}/{len(retry_delays)}次)"
-            )
-            if result.get("msg") != "session not found" or attempt >= len(retry_delays) - 1:
-                break
-            # The iframe may be recreating its WebRTC session; give it a short
-            # window before dropping this sentence's mouth-driving request.
-            time.sleep(retry_delay)
-        return False
-    except requests.ConnectionError:
-        logger.warning("口型驱动: LiveTalking 不可达，跳过")
-        return False
-    except Exception as e:
-        logger.warning(f"口型驱动: 转发异常 - {e}")
-        return False
+                result = {"code": response.status_code, "msg": response.text[:200]}
+            if response.status_code != 200 or result.get("code", 0) != 0:
+                self._failed.set()
+                logger.warning(
+                    "口型驱动: 持续音频流失败 HTTP %s: %s",
+                    response.status_code,
+                    result,
+                )
+            else:
+                logger.info("口型驱动: 持续音频流结束 -> %s", result)
+        except requests.ConnectionError:
+            self._failed.set()
+            logger.warning("口型驱动: LiveTalking 持续音频流不可达")
+        except Exception:
+            self._failed.set()
+            logger.error("口型驱动: 持续音频流异常 - %s", traceback.format_exc())
+        finally:
+            self._closed.set()
+
+    def push(self, audio_data: np.ndarray) -> bool:
+        if self._closed.is_set() or self._failed.is_set():
+            return False
+        raw = np.asarray(audio_data).reshape(-1)
+        if not raw.size:
+            return True
+        if np.issubdtype(raw.dtype, np.integer):
+            audio_f32 = raw.astype(np.float32) / 32767.0
+        else:
+            audio_f32 = raw.astype(np.float32)
+        audio_f32 = np.clip(audio_f32, -1.0, 1.0)
+
+        # Keep the existing mouth-driving level while preserving a continuous
+        # stream. The limiter prevents one loud model chunk from clipping.
+        rms = float(np.sqrt(np.mean(audio_f32.astype(np.float64) ** 2)))
+        peak = float(np.max(np.abs(audio_f32)))
+        if rms < 0.008:
+            gain = 1.0
+        else:
+            gain = min(0.316 / rms, 0.95 / max(peak, 1e-6), 4.0)
+        pcm = np.clip(audio_f32 * gain, -1.0, 1.0).astype("<i2")
+        try:
+            self._queue.put(pcm.tobytes(), timeout=2.0)
+            return True
+        except queue.Full:
+            logger.warning("口型驱动: 持续音频流队列阻塞，丢弃当前片段")
+            return False
+
+    def close(self):
+        if self._closed.is_set():
+            return
+        try:
+            self._queue.put(None, timeout=2.0)
+        except queue.Full:
+            logger.warning("口型驱动: 持续音频流关闭超时")
+        self._thread.join(timeout=5.0)
 
 
 # =============================================================================
@@ -1307,7 +1339,25 @@ class ConversationPipeline:
         self.history: List[dict] = [
             {"role": "system", "content": "你是一个友善、体贴的AI语音助手，说话温柔自然，用中文回复。回复自然、有陪伴感、口语化，适合语音朗读；根据用户需要决定回复长度，不要为了语音合成而刻意缩短内容。"}
         ]
-        self._audio_segments: List[tuple] = []  # 累积 (audio_np, sample_rate) 用于最后一次性送口型
+        self._avatar_stream: Optional[LiveTalkingAudioStream] = None
+        self._avatar_stream_lock = threading.Lock()
+
+    def _push_avatar_audio(self, audio_data: np.ndarray, sample_rate: int) -> bool:
+        """把每个 VoxCPM 音频片段直接写入持久 LiveTalking 音频流。"""
+        with self._avatar_stream_lock:
+            if self._avatar_stream is None:
+                self._avatar_stream = LiveTalkingAudioStream(
+                    LIVETALKING_URL, "0", int(sample_rate)
+                )
+            stream = self._avatar_stream
+        return stream.push(audio_data)
+
+    def _close_avatar_audio_stream(self):
+        with self._avatar_stream_lock:
+            stream = self._avatar_stream
+            self._avatar_stream = None
+        if stream is not None:
+            stream.close()
 
     def _backchannel_event(self):
         """返回已预热的克隆音色短回声，避免用户等待时完全无反馈。"""
@@ -1396,7 +1446,7 @@ class ConversationPipeline:
                 self.history = [self.history[0]] + self.history[-40:]
 
         state_machine.transition(AvatarState.IDLE)
-        self._flush_avatar_audio()
+        self._close_avatar_audio_stream()
         yield {"type": "status", "state": "idle", "text": "待机"}
 
     def process_text(self, text: str) -> Generator[dict, None, None]:
@@ -1443,6 +1493,7 @@ class ConversationPipeline:
                 self.history = [self.history[0]] + self.history[-40:]
 
         state_machine.transition(AvatarState.IDLE)
+        self._close_avatar_audio_stream()
         yield {"type": "status", "state": "idle", "text": "待机"}
 
     def _synthesize_and_dispatch(self, text: str, session_id: str,
@@ -1460,8 +1511,8 @@ class ConversationPipeline:
                 for audio, sr in engine.stream_synthesize(text, cancel_event):
                     if cancel_event.is_set():
                         return
-                    self._audio_segments.append((audio, sr))
                     audio_int16 = (audio * 32767).astype(np.int16)
+                    self._push_avatar_audio(audio, sr)
                     yield {"type": "audio", "data": (sr, audio_int16)}
                 return
 
@@ -1474,12 +1525,9 @@ class ConversationPipeline:
                 return
 
             if audio is not None and sr > 0:
-                # Put the segment into the avatar buffer before yielding the
-                # browser event. The UI handler flushes the buffer immediately
-                # after it receives the event; appending after yield would make
-                # a one-sentence reply play audio without moving the mouth.
-                self._audio_segments.append((audio, sr))
-                logger.info(f"口型驱动: 累积音频 {len(audio)} 采样点 (第{len(self._audio_segments)}段)")
+                # Push into the persistent LiveTalking stream before yielding
+                # the UI event, so audio and mouth motion start together.
+                self._push_avatar_audio(audio, sr)
 
                 # 路径A: 回传浏览器播放
                 audio_int16 = (audio * 32767).astype(np.int16)
@@ -1575,7 +1623,7 @@ class ConversationPipeline:
             if event["type"] == "audio":
                 sr, audio_data = event["data"]
                 audio_f32 = audio_data.astype(np.float32) / 32767.0
-                self._audio_segments.append((audio_f32, sr))
+                self._push_avatar_audio(audio_f32, sr)
                 if not speaking_started:
                     state_machine.transition(AvatarState.SPEAKING)
                     speaking_started = True
@@ -1591,54 +1639,8 @@ class ConversationPipeline:
     def stop(self):
         """停止/打断"""
         state_machine.transition(AvatarState.IDLE)
+        self._close_avatar_audio_stream()
         logger.info("用户触发停止/打断")
-
-    def _flush_avatar_audio(self, delay_sec: float = 0.0,
-                            background: bool = True):
-        """发送已累积的 TTS 片段到 LiveTalking 驱动口型。
-
-        文本分段播放使用同步路径，避免下一次 GPU 合成抢在对应的口型请求
-        之前开始；语音输入仍使用后台路径，保持原有流程。
-        """
-        if not self._audio_segments:
-            return False
-        try:
-            # 拼接所有音频段
-            all_audio = np.concatenate([seg for seg, _ in self._audio_segments])
-            sr = self._audio_segments[0][1]  # 所有段用同一个采样率
-
-            # RMS 归一化到约 -10dBFS，保证口型明显（wav2lip 对音量极其敏感）。
-            # 近乎静音的流式尾段不能按 RMS 无限放大，否则会把编码底噪放大成爆音。
-            rms = float(np.sqrt(np.mean(all_audio.astype(np.float64) ** 2)))
-            peak = float(np.max(np.abs(all_audio))) if len(all_audio) else 0.0
-            target_rms = 0.316  # -10dBFS
-            if rms < 0.008:
-                gain = 1.0
-            else:
-                desired_gain = target_rms / rms
-                peak_safe_gain = 0.95 / max(peak, 1e-6)
-                gain = min(desired_gain, peak_safe_gain, 4.0)
-            all_audio = np.clip(all_audio * gain, -1.0, 1.0).astype(np.float32)
-
-            total_sec = len(all_audio) / sr
-            logger.info(f"口型驱动: 发送完整音频 {len(all_audio)}样本 @ {sr}Hz ({total_sec:.1f}s) "
-                        f"原始RMS={rms:.4f}, 峰值={peak:.4f} → 增益={gain:.1f}x "
-                        f"({20*np.log10(max(gain, 1e-6)):.0f}dB)")
-            def dispatch_avatar_audio():
-                if delay_sec > 0:
-                    time.sleep(delay_sec)
-                return forward_audio_to_avatar(all_audio, sr, "0")
-
-            if background:
-                threading.Thread(target=dispatch_avatar_audio, daemon=True).start()
-                return None
-            else:
-                return dispatch_avatar_audio()
-        except Exception as e:
-            logger.error(f"口型驱动: 拼接/转发失败 - {e}")
-            return False
-        finally:
-            self._audio_segments = []
 
     def clear_history(self):
         """清除对话历史"""
@@ -2314,12 +2316,8 @@ def create_ui():
                                     f"TTS WebRTC 播放: 第{progressive_audio_count}段 "
                                     f"{duration:.1f}s"
                                 )
-                                # WebRTC is the only browser playback path. It
-                                # carries the same PCM sent to LiveTalking and
-                                # therefore stays aligned with the mouth motion.
-                                pipeline._flush_avatar_audio(
-                                    delay_sec=0.05, background=False
-                                )
+                                # ConversationPipeline has already written this
+                                # chunk into the persistent LiveTalking stream.
                                 yield "", new_history, "播放中", audio_skip()
                             else:
                                 audio_segments.append(audio_data)
@@ -2336,7 +2334,7 @@ def create_ui():
             # empty audio update, otherwise Gradio can clear the last chunk.
             if progressive_audio_count:
                 logger.info(
-                    f"TTS 分段播放结束: 共{progressive_audio_count}段，未限制回复长度"
+                    f"TTS 持续流播放结束: 共{progressive_audio_count}段，未限制回复长度"
                 )
                 return
 
@@ -2354,7 +2352,6 @@ def create_ui():
                 yield "", new_history, "播放中", dump_path
                 # Gradio receives the browser audio update before LiveTalking starts,
                 # keeping visible mouth motion aligned with local playback startup.
-                pipeline._flush_avatar_audio(delay_sec=0.20)
                 # 音频已送出，不再 yield None 覆盖它
                 return
 
@@ -2412,11 +2409,8 @@ def create_ui():
                     elif event["type"] == "audio":
                         # 语音输入链路此前漏掉了 audio 事件，导致音频只
                         # 累积在管线里，直到整轮结束才尝试发送。现在每个
-                        # TTS 片段生成后立即送入 LiveTalking WebRTC。
+                        # ConversationPipeline 已将片段写入持久 LiveTalking 流。
                         audio_count += 1
-                        pipeline._flush_avatar_audio(
-                            delay_sec=0.05, background=False
-                        )
                         status = "播放中"
                         yield chat_history, status, ""
                     elif event["type"] == "error":

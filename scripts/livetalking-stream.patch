@@ -1,0 +1,90 @@
+diff --git a/LiveTalking/server/routes.py b/LiveTalking/server/routes.py
+--- a/LiveTalking/server/routes.py
++++ b/LiveTalking/server/routes.py
+@@ -3,3 +3,4 @@
+ import json
+ import asyncio
++import numpy as np
+ from aiohttp import web
+@@ -107,1 +107,75 @@ async def humanaudio(request):
+ return json_error(str(e))
++
++async def humanaudio_stream(request):
++    """持续接收 pcm_s16le 音频，并按 20ms 帧写入口型队列。"""
++    try:
++        sessionid = str(
++            request.query.get('sessionid')
++            or request.headers.get('X-Session-Id', '')
++        )
++        avatar_session = get_session(request, sessionid)
++        if avatar_session is None:
++            return json_error("session not found")
++
++        source_rate = int(request.headers.get('X-Audio-Sample-Rate', '48000'))
++        if source_rate <= 0:
++            return json_error("invalid audio sample rate")
++        source_chunk = max(1, round(source_rate / 50))
++        target_rate = int(avatar_session.sample_rate)
++        target_chunk = int(avatar_session.chunk)
++        pending = bytearray()
++        pending_samples = np.empty(0, dtype=np.float32)
++        first_frame = True
++        last_frame = None
++
++        def convert_chunk(source_audio):
++            if source_rate == target_rate:
++                return source_audio
++            source_positions = np.arange(source_audio.size, dtype=np.float32)
++            target_size = max(1, round(source_audio.size * target_rate / source_rate))
++            target_positions = np.linspace(
++                0, max(source_audio.size - 1, 0), target_size, dtype=np.float32
++            )
++            return np.interp(target_positions, source_positions, source_audio).astype(
++                np.float32
++            )
++
++        def emit_frame(frame, status):
++            datainfo = {'status': status} if status else {}
++            avatar_session.put_audio_frame(frame, datainfo)
++
++        async for data in request.content.iter_chunked(4096):
++            pending.extend(data)
++            usable = len(pending) - (len(pending) % 2)
++            if usable <= 0:
++                continue
++            pcm = np.frombuffer(bytes(pending[:usable]), dtype='<i2').astype(
++                np.float32
++            ) / 32768.0
++            del pending[:usable]
++            pending_samples = np.concatenate((pending_samples, pcm))
++
++            while pending_samples.size >= source_chunk:
++                source_frame = pending_samples[:source_chunk]
++                pending_samples = pending_samples[source_chunk:]
++                target_frame = convert_chunk(source_frame)
++                if target_frame.size < target_chunk:
++                    continue
++                target_frame = target_frame[:target_chunk]
++                if last_frame is not None:
++                    emit_frame(last_frame, 'start' if first_frame else '')
++                    first_frame = False
++                last_frame = target_frame
++
++        if pending_samples.size:
++            target_frame = convert_chunk(pending_samples)
++            if target_frame.size >= target_chunk:
++                if last_frame is not None:
++                    emit_frame(last_frame, 'start' if first_frame else '')
++                    first_frame = False
++                last_frame = target_frame[:target_chunk]
++        if last_frame is not None:
++            emit_frame(last_frame, 'end')
++        return json_ok({'sample_rate': target_rate, 'streaming': True})
++    except Exception as e:
++        logger.exception('humanaudio_stream exception:')
++        return json_error(str(e))
+@@ -247,3 +324,4 @@ def setup_routes(app):
+     app.router.add_post("/human", human)
+     app.router.add_post("/humanaudio", humanaudio)
++    app.router.add_post("/humanaudio/stream", humanaudio_stream)
+     app.router.add_post("/set_audiotype", set_audiotype)

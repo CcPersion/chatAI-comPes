@@ -33,6 +33,11 @@ fuser -k 8020/tcp 2>/dev/null || true
 sleep 2
 
 echo "=== 启动 LiveTalking (8010) ==="
+if [[ -f "$ROOT_DIR/scripts/livetalking-stream.patch" ]] && \
+   ! grep -q "async def humanaudio_stream" "$ROOT_DIR/LiveTalking/server/routes.py"; then
+  echo "=== 应用 LiveTalking 持续音频流补丁 ==="
+  patch -p1 -d "$ROOT_DIR" < "$ROOT_DIR/scripts/livetalking-stream.patch"
+fi
 cd "$ROOT_DIR/LiveTalking"
 nohup "$MAIN_PYTHON" app.py --transport webrtc --model wav2lip --avatar_id wav2lip256_avatar_256 --listenport 8010 > /tmp/livetalking.log 2>&1 &
 echo "  PID=$!"
