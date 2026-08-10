@@ -84,6 +84,39 @@ def test_status_summary_and_details_include_non_color_state_text():
     assert "数字人口型" in details and "未连接" in details
 
 
+def test_build_system_prompt_combines_role_preset_and_custom_instruction():
+    style = next(iter(app.ROLE_STYLE_PRESETS))
+
+    prompt = app.build_system_prompt(style, "custom local note")
+
+    assert app.ROLE_STYLE_PRESETS[style] in prompt
+    assert "custom local note" in prompt
+    assert "语音助手" in prompt
+
+
+def test_apply_runtime_settings_updates_pipeline_persona(monkeypatch):
+    captured = {}
+    fake_pipeline = SimpleNamespace(
+        vad=SimpleNamespace(threshold=0.0, min_silence_ms=0),
+        _close_avatar_audio_stream=lambda: None,
+        set_role_style=lambda style, custom: captured.update(style=style, custom=custom),
+    )
+    fake_tts = SimpleNamespace(style_prompt="")
+    monkeypatch.setattr(app, "pipeline", fake_pipeline)
+    monkeypatch.setattr(app, "tts_engine", fake_tts)
+    monkeypatch.setattr(app, "config", dict(app.config))
+    monkeypatch.setattr(app, "_persist_runtime_settings", lambda values: None)
+
+    values = dict(zip(app.EDITABLE_RUNTIME_KEYS, app.get_runtime_form_values()))
+    values["ROLE_STYLE"] = next(iter(app.ROLE_STYLE_PRESETS))
+    values["ROLE_CUSTOM_INSTRUCTION"] = "custom local note"
+
+    result = app.apply_runtime_settings(values)
+
+    assert result["ok"] is True
+    assert captured == {"style": values["ROLE_STYLE"], "custom": "custom local note"}
+
+
 def test_utility_panel_updates_are_mutually_exclusive():
     drawer, title, settings, logs, status = app.toggle_utility_panel("logs")
 

@@ -68,6 +68,8 @@ VOXCPM_SAMPLE_RATE: 48000
 VOXCPM_WORKER_URL: "http://127.0.0.1:8020"
 VOXCPM_LOCAL_FILES_ONLY: true
 VOXCPM_STYLE_PROMPT: "语速自然"
+ROLE_STYLE: "温柔陪伴"
+ROLE_CUSTOM_INSTRUCTION: ""
 # VoxCPM2 原生括号指令，只影响合成语音，不改变聊天界面文本。
 # 预热音频只用于后台热身，不在正式回答前播放，避免等待阶段出现杂音。
 # CosyVoice3 首块 token 数；更小首块更快，后续块自动放大保持音质。

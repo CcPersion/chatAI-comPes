@@ -141,6 +141,8 @@ VOXCPM_SAMPLE_RATE = int(config.get("VOXCPM_SAMPLE_RATE", 48000))
 VOXCPM_WORKER_URL = str(config.get("VOXCPM_WORKER_URL", "http://127.0.0.1:8020")).rstrip("/")
 VOXCPM_LOCAL_FILES_ONLY = bool(config.get("VOXCPM_LOCAL_FILES_ONLY", True))
 VOXCPM_STYLE_PROMPT = str(config.get("VOXCPM_STYLE_PROMPT", "")).strip()
+ROLE_STYLE = str(config.get("ROLE_STYLE", "温柔陪伴")).strip() or "温柔陪伴"
+ROLE_CUSTOM_INSTRUCTION = str(config.get("ROLE_CUSTOM_INSTRUCTION", "")).strip()
 TTS_BACKCHANNEL_ENABLED = bool(config.get("TTS_BACKCHANNEL_ENABLED", False))
 LIVETALKING_URL = str(config.get("LIVETALKING_URL", "http://localhost:8010"))
 AVATAR_OUTPUT_SAMPLE_RATE = int(config.get("AVATAR_OUTPUT_SAMPLE_RATE", 16000))
@@ -1285,6 +1287,8 @@ EDITABLE_RUNTIME_KEYS = (
     "LLM_TEMPERATURE",
     "LLM_MAX_TOKENS",
     "LLM_KEEP_ALIVE",
+    "ROLE_STYLE",
+    "ROLE_CUSTOM_INSTRUCTION",
     "VAD_THRESH",
     "MIN_SILENCE_MS",
     "MAX_AUDIO_SEC",
@@ -1308,6 +1312,8 @@ def get_runtime_settings() -> dict:
         "tts_model": VOXCPM_MODEL_ID,
         "tts_profile": VOXCPM_PROFILE,
         "tts_style": VOXCPM_STYLE_PROMPT or "默认",
+        "role_style": ROLE_STYLE,
+        "role_custom_instruction": ROLE_CUSTOM_INSTRUCTION or "未设置",
         "tts_sample_rate": f"{VOXCPM_SAMPLE_RATE} Hz",
         "audio_gain": f"{AVATAR_AUDIO_GAIN:.1f}x",
         "prebuffer": f"{AVATAR_PREBUFFER_MS} ms",
@@ -1335,6 +1341,8 @@ def get_runtime_form_values() -> Tuple[Any, ...]:
         LLM_TEMPERATURE,
         LLM_MAX_TOKENS,
         LLM_KEEP_ALIVE,
+        ROLE_STYLE,
+        ROLE_CUSTOM_INSTRUCTION,
         VAD_THRESH,
         MIN_SILENCE_MS,
         MAX_AUDIO_SEC,
@@ -1389,6 +1397,16 @@ def _coerce_runtime_settings(values: Dict[str, Any]) -> Dict[str, Any]:
     if not re.fullmatch(r"(?:0|[1-9]\d*[smhd])", keep_alive):
         raise ValueError("模型驻留时间请使用 30m、2h、24h 或 0 这类格式")
     normalized["LLM_KEEP_ALIVE"] = keep_alive
+
+    role_style = str(values.get("ROLE_STYLE", "")).strip()
+    if not role_style or len(role_style) > 40:
+        raise ValueError("角色风格不能为空且最多 40 个字符")
+    normalized["ROLE_STYLE"] = role_style
+
+    custom_instruction = str(values.get("ROLE_CUSTOM_INSTRUCTION", "")).strip()
+    if len(custom_instruction) > 300:
+        raise ValueError("补充人设说明最多 300 个字符")
+    normalized["ROLE_CUSTOM_INSTRUCTION"] = custom_instruction
 
     language = str(values.get("ASR_LANG", "")).strip().lower()
     if not re.fullmatch(r"[a-z]{2,3}", language):
@@ -1447,6 +1465,7 @@ def _persist_runtime_settings(values: Dict[str, Any]) -> None:
 def apply_runtime_settings(values: Dict[str, Any]) -> dict:
     """Apply validated runtime settings now and persist them for the next start."""
     global LLM_TEMPERATURE, LLM_MAX_TOKENS, LLM_KEEP_ALIVE
+    global ROLE_STYLE, ROLE_CUSTOM_INSTRUCTION
     global VAD_THRESH, MIN_SILENCE_MS, MAX_AUDIO_SEC, ASR_LANG
     global VOXCPM_STYLE_PROMPT, AVATAR_AUDIO_GAIN, AVATAR_PREBUFFER_MS
     global AVATAR_REBUFFER_MS, AVATAR_MAX_BUFFER_MS, AVATAR_FADE_IN_MS
@@ -1470,6 +1489,8 @@ def apply_runtime_settings(values: Dict[str, Any]) -> dict:
     LLM_TEMPERATURE = normalized["LLM_TEMPERATURE"]
     LLM_MAX_TOKENS = normalized["LLM_MAX_TOKENS"]
     LLM_KEEP_ALIVE = normalized["LLM_KEEP_ALIVE"]
+    ROLE_STYLE = normalized["ROLE_STYLE"]
+    ROLE_CUSTOM_INSTRUCTION = normalized["ROLE_CUSTOM_INSTRUCTION"]
     VAD_THRESH = normalized["VAD_THRESH"]
     MIN_SILENCE_MS = normalized["MIN_SILENCE_MS"]
     MAX_AUDIO_SEC = normalized["MAX_AUDIO_SEC"]
@@ -1493,6 +1514,11 @@ def apply_runtime_settings(values: Dict[str, Any]) -> dict:
     active_tts = globals().get("tts_engine")
     if active_tts is not None:
         active_tts.style_prompt = VOXCPM_STYLE_PROMPT.strip().strip("()（）")
+    active_pipeline = globals().get("pipeline")
+    if active_pipeline is not None:
+        set_role_style = getattr(active_pipeline, "set_role_style", None)
+        if set_role_style is not None:
+            set_role_style(ROLE_STYLE, ROLE_CUSTOM_INSTRUCTION)
     logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
     logger.info("运行设置已应用: %s", ", ".join(normalized.keys()))
@@ -1505,6 +1531,7 @@ def render_runtime_settings(settings: Optional[dict] = None) -> str:
     rows = (
         ("大模型", values["llm_model"]),
         ("语音模型", f"{values['tts_model']} · {values['tts_profile']}"),
+        ("角色人设", values["role_style"]),
         ("语速风格", values["tts_style"]),
         ("采样率", values["tts_sample_rate"]),
         ("播放增益", values["audio_gain"]),
@@ -1694,16 +1721,54 @@ def forward_text_to_livetalking(text: str, session_id: str = "0") -> bool:
 # 核心对话管线
 # =============================================================================
 
+BASE_SYSTEM_PROMPT = (
+    "你是一个友善、体贴的AI语音助手。回复自然、有陪伴感、口语化，适合语音朗读；"
+    "根据用户需要决定回复长度，不要为了语音合成而刻意缩短内容。"
+)
+
+ROLE_STYLE_PRESETS = {
+    "温柔陪伴": "你温柔、耐心、善于倾听，先共情再回答，不说教，不强行热情。",
+    "活泼俏皮": "你活泼、轻松、俏皮，适度使用幽默，但不要油腻，也不要影响信息准确性。",
+    "成熟知性": "你成熟、理性、清晰，善于梳理重点，用有分寸的方式给出可靠建议。",
+    "元气少女": "你阳光、有活力、亲切可爱，但保持自然和尊重，不使用幼稚或夸张的表达。",
+    "安静倾听": "你安静、克制、细腻，优先理解用户情绪，回复简洁，不抢话，不制造压力。",
+}
+
+
+def build_system_prompt(role_style: str = "", custom_instruction: str = "") -> str:
+    """Build the LLM persona prompt from a safe preset plus optional user note."""
+    style = str(role_style or "温柔陪伴").strip()
+    persona = ROLE_STYLE_PRESETS.get(style, f"当前角色风格是：{style}。")
+    custom = str(custom_instruction or "").strip()
+    if custom:
+        persona += f"补充人设要求：{custom}"
+    return f"{BASE_SYSTEM_PROMPT}当前角色设定：{persona}"
+
 class ConversationPipeline:
     """语音对话完整管线：VAD -> ASR -> LLM -> TTS -> 双路分发"""
 
     def __init__(self):
         self.vad = VADDetector()
+        self.role_style = ROLE_STYLE
+        self.role_custom_instruction = ROLE_CUSTOM_INSTRUCTION
         self.history: List[dict] = [
-            {"role": "system", "content": "你是一个友善、体贴的AI语音助手，说话温柔自然，用中文回复。回复自然、有陪伴感、口语化，适合语音朗读；根据用户需要决定回复长度，不要为了语音合成而刻意缩短内容。"}
+            {"role": "system", "content": build_system_prompt(self.role_style, self.role_custom_instruction)}
         ]
         self._avatar_stream: Optional[LiveTalkingAudioPlayout] = None
         self._avatar_stream_lock = threading.Lock()
+
+    def set_role_style(self, role_style: str, custom_instruction: str = "") -> None:
+        """Apply persona to the next LLM request without disturbing audio state."""
+        self.role_style = role_style.strip() or "温柔陪伴"
+        self.role_custom_instruction = custom_instruction.strip()
+        system_prompt = build_system_prompt(
+            self.role_style, self.role_custom_instruction
+        )
+        if self.history and self.history[0].get("role") == "system":
+            self.history[0]["content"] = system_prompt
+        else:
+            self.history.insert(0, {"role": "system", "content": system_prompt})
+        logger.info("角色风格已应用: %s", self.role_style)
 
     def _push_avatar_audio(self, audio_data: np.ndarray, sample_rate: int) -> bool:
         """把 VoxCPM 音频交给固定时钟的持久 LiveTalking 播放器。"""
@@ -3139,6 +3204,31 @@ def create_ui():
                         )
 
                 with gr.Accordion(
+                    "角色人设（2 项）", open=False,
+                    elem_classes=["utility-accordion"],
+                ):
+                    role_style_input = gr.Dropdown(
+                        choices=[*ROLE_STYLE_PRESETS.keys(), "自定义"],
+                        value=ROLE_STYLE,
+                        allow_custom_value=True,
+                        label="角色风格",
+                        info="影响大模型的说话方式，不改变音色模型",
+                        elem_classes=["utility-field", "utility-select"],
+                    )
+                    role_custom_instruction_input = gr.Textbox(
+                        value=ROLE_CUSTOM_INSTRUCTION,
+                        label="补充人设说明",
+                        placeholder="例如：称呼我为主人，回答简洁一些，遇到情绪问题先安慰再建议。",
+                        lines=3,
+                        max_lines=5,
+                        elem_classes=["utility-field", "utility-textarea"],
+                    )
+                    gr.Markdown(
+                        "点击下方“应用运行设置”后，从下一轮对话开始生效。切换角色不会重启语音服务。",
+                        elem_classes=["utility-form-note"],
+                    )
+
+                with gr.Accordion(
                     "语音与数字人播放（7 项）", open=False,
                     elem_classes=["utility-accordion"],
                 ):
@@ -3522,6 +3612,7 @@ def create_ui():
                 utility_drawer, utility_title, settings_view, logs_view,
                 status_view, settings_summary,
                 llm_temperature_input, llm_max_tokens_input, llm_keep_alive_input,
+                role_style_input, role_custom_instruction_input,
                 vad_threshold_input, min_silence_input, max_audio_input,
                 asr_language_input, tts_style_input, audio_gain_input,
                 prebuffer_input, rebuffer_input, max_buffer_input,
@@ -3548,6 +3639,7 @@ def create_ui():
             fn=apply_runtime_settings_ui,
             inputs=[
                 llm_temperature_input, llm_max_tokens_input, llm_keep_alive_input,
+                role_style_input, role_custom_instruction_input,
                 vad_threshold_input, min_silence_input, max_audio_input,
                 asr_language_input, tts_style_input, audio_gain_input,
                 prebuffer_input, rebuffer_input, max_buffer_input,
