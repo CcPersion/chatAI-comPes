@@ -28,7 +28,7 @@ echo "  PID=$!"
 
 echo "=== 启动 avatar-sync (8011) ==="
 cd "$ROOT_DIR"
-nohup node avatar-sync.js > /tmp/avatar-sync.log 2>&1 &
+nohup node "$ROOT_DIR/scripts/avatar-sync.js" > /tmp/avatar-sync.log 2>&1 &
 echo "  PID=$!"
 
 echo "=== 启动 VoxCPM Worker (8020) ==="
