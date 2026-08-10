@@ -60,3 +60,22 @@ completed: 2026-08-05
 - Mouth transport: pass; matching `humanaudio`/`put audio stream` observed.
 - Microphone browser permission: not assessed in automation because the browser context denied microphone access.
 - Qwen `1.7B` remains a non-streaming Python generation backend; the implementation reduces time-to-first-sentence but does not claim sub-second neural audio generation.
+
+## Phase 7: VoxCPM voice-pipeline rewrite (current)
+
+| Stage | Owner | Result | Evidence |
+|---|---|---|---|
+| Backup | Orchestrator | pass | Git commit `3b808b3` preserves the pre-VoxCPM implementation |
+| PM | PM | pass | `knowledge/PRD.md` updated with VoxCPM2 default and VoxCPM1.5 fallback |
+| Architecture | Architect | pass | `knowledge/架构设计.md`, `knowledge/API契约.md` define Worker/NDJSON/cancellation/sample-rate contracts |
+| Developer | Developer + Orchestrator | pass | `outputs/backend/voxcpm_worker.py`, `voxcpm_client.py`, dedicated install/start scripts, app integration |
+| QA | QA | pass with environment blocker | `outputs/qa/voxcpm重写测试策略.md`, `outputs/qa/voxcpm重写测试报告.md`; 6 tests pass, real model/browser gates remain pending |
+| Reviewer | Orchestrator review gate | conditional pass | `outputs/reviewer/voxcpm重写评审报告.md`; code may be committed, real product acceptance remains blocked |
+
+### Phase 7 gate status
+
+- `py_compile`, `pytest`, `bash -n`, YAML parse, and `git diff --check`: pass.
+- Protocol tests: 5 passed.
+- RTX 5060 Ti detected: 16,311 MiB total; current free memory varies with other processes.
+- Real VoxCPM model load, GPU peak VRAM, warm P50/P95, blind listening, interruption latency, and browser/LiveTalking acceptance: not yet verified.
+- `CONSTITUTION.md` is not present in the repository; the security baseline remains pending rather than claimed complete.

@@ -6,7 +6,7 @@ app.py — local-ai-companion-v2 Gradio 主应用 (speech-to-speech 管线)
 配置文件: ~/setup/voice.yaml（自动查找）
 端口: 7860 (Gradio 默认)
 =============================================================================
-架构: VAD → faster-whisper (ASR) → llama.cpp (LLM转发) → Qwen3-TTS → 双路分发
+架构: VAD → faster-whisper (ASR) → llama.cpp (LLM转发) → VoxCPM Worker → 双路分发
   数字人状态机: 待机 → 倾听 → 思考 → 说话
   打断控制: 取消令牌贯穿 LLM/TTS/播放
 =============================================================================
@@ -37,6 +37,11 @@ import yaml
 import requests
 import httpx
 import numpy as np
+
+try:
+    from outputs.backend.voxcpm_client import VoxCPMClient
+except ImportError:  # direct ``python outputs/backend/app.py`` execution
+    from voxcpm_client import VoxCPMClient
 
 # ---- 日志配置 ----
 logging.basicConfig(
@@ -120,19 +125,14 @@ LLM_MAX_TOKENS = int(config.get("LLM_MAX_TOKENS", 1024))
 LLM_TEMPERATURE = float(config.get("LLM_TEMPERATURE", 0.7))
 LLM_KEEP_ALIVE = str(config.get("LLM_KEEP_ALIVE", "30m"))
 LLM_WARMUP_ENABLED = bool(config.get("LLM_WARMUP_ENABLED", True))
-TTS_MODEL_PATH = os.path.expanduser(str(config.get("TTS_MODEL_PATH", "~/setup/models/Qwen3-TTS-1.7B")))
-TTS_REF_WAV = os.path.expanduser(str(config.get("TTS_REF_WAV", "~/setup/ref.wav")))
-TTS_REF_TEXT = str(config.get("TTS_REF_TEXT", ""))
-TTS_SAMPLE_RATE = int(config.get("TTS_SAMPLE_RATE", 16000))
-TTS_BACKEND = str(config.get("TTS_BACKEND", "qwen")).strip().lower()
-TTS_BACKCHANNEL_ENABLED = bool(config.get("TTS_BACKCHANNEL_ENABLED", False))
-COSYVOICE_REPO = os.path.expanduser(str(config.get("COSYVOICE_REPO", "/root/setup/CosyVoice")))
-COSYVOICE_MODEL_PATH = os.path.expanduser(str(config.get("COSYVOICE_MODEL_PATH", "~/setup/models/CosyVoice2-0.5B")))
-COSYVOICE_FP16 = bool(config.get("COSYVOICE_FP16", True))
-COSYVOICE_STREAM_HOP_TOKENS = int(config.get("COSYVOICE_STREAM_HOP_TOKENS", 0))
-EDGE_TTS_VOICE = str(config.get("EDGE_TTS_VOICE", "zh-CN-XiaoxiaoNeural"))
-EDGE_TTS_RATE = str(config.get("EDGE_TTS_RATE", "+0%"))
-QWEN_ATTN_IMPLEMENTATION = str(config.get("QWEN_ATTN_IMPLEMENTATION", "sdpa"))
+VOXCPM_MODEL_ID = str(config.get("VOXCPM_MODEL_ID", "VoxCPM2"))
+VOXCPM_PROFILE = str(config.get("VOXCPM_PROFILE", "balanced-v2"))
+VOXCPM_MODEL_PATH = os.path.expanduser(str(config.get("VOXCPM_MODEL_PATH", "~/setup/models/VoxCPM2")))
+VOXCPM_REF_WAV = os.path.expanduser(str(config.get("VOXCPM_REF_WAV", "")))
+VOXCPM_REF_TEXT = str(config.get("VOXCPM_REF_TEXT", ""))
+VOXCPM_SAMPLE_RATE = int(config.get("VOXCPM_SAMPLE_RATE", 48000))
+VOXCPM_WORKER_URL = str(config.get("VOXCPM_WORKER_URL", "http://127.0.0.1:8020")).rstrip("/")
+VOXCPM_LOCAL_FILES_ONLY = bool(config.get("VOXCPM_LOCAL_FILES_ONLY", True))
 LIVETALKING_URL = str(config.get("LIVETALKING_URL", "http://localhost:8010"))
 AVATAR_SYNC_URL = str(config.get("AVATAR_SYNC_URL", "http://localhost:8011"))
 UPLOAD_DIR = os.path.expanduser(str(config.get("UPLOAD_DIR", "~/setup/uploads")))
@@ -263,13 +263,23 @@ def get_service_status() -> dict:
     获取所有服务的连接状态。
     SEC-17: 不暴露内部配置、模型路径等字段。
     """
-    status = {
+    status = {}
+    try:
+        tts_health = requests.get(f"{VOXCPM_WORKER_URL}/api/tts/health", timeout=2.0)
+        payload = tts_health.json()
+        status["tts"] = "ready" if tts_health.status_code == 200 and payload.get("ready") is True and payload.get("status") in {"ready", "busy"} else "degraded"
+    except requests.ConnectionError:
+        status["tts"] = "disconnected"
+    except requests.Timeout:
+        status["tts"] = "timeout"
+    except Exception:
+        status["tts"] = "error"
+    status.update({
         "llama": check_service("llama-server", f"{LLM_BASE_URL}/api/tags"),
         "asr": "ready",   # ASR 在本地进程内，始终就绪
-        "tts": "ready",   # TTS 在本地进程内，始终就绪
         "livetalking": check_service("LiveTalking", f"{LIVETALKING_URL}/health"),
         "avatar_sync": check_service("avatar-sync", f"{AVATAR_SYNC_URL}/health"),
-    }
+    })
     # 整体状态
     all_ok = all(v == "connected" or v == "ready" for v in status.values())
     status["overall"] = "ready" if all_ok else "partial"
@@ -644,10 +654,14 @@ def normalize_tts_text(text: str) -> str:
 
 
 # =============================================================================
-# TTS 模块（Qwen3-TTS 1.7B + 音色克隆，#5 架构设计）
+# TTS 模块：VoxCPM 独立 Worker
 # =============================================================================
 
-class EdgeTTSEngine:
+''' LEGACY TTS IMPLEMENTATIONS (inert reference only; never executed).
+The application must never instantiate the removed local TTS engines. Audio is
+produced only by the local VoxCPM worker.
+
+class _RemovedLegacyTTSEngine:
     """Low-latency neural TTS used by the immersive realtime mode."""
 
     def __init__(self):
@@ -844,21 +858,15 @@ class TTSEngine:
         return np.copy(audio), sr
 
 
-# 全局 TTS 引擎（懒加载，阶段 2 才需要）
+# 全局 TTS 客户端（懒加载）
 # 注意：不在模块导入时初始化，避免 CUDA 模型加载卡死启动。
 # 首次语音合成时通过 _get_tts() 按需加载。
 tts_engine = None
-class CosyVoiceTTSEngine:
-    """Local streaming zero-shot voice cloning with a cached speaker prompt."""
+class VoxCPMEngine:
+    """Thin adapter that exposes the worker client's streaming contract."""
 
     def __init__(self):
-        self.model = None
-        self.ref_wav = TTS_REF_WAV
-        self.voice_id = "chat-companion-cloned-voice"
-        self._backchannel_audio = None
-        self._backchannel_lock = threading.Lock()
-        self._inference_lock = threading.Lock()
-        self._init_model()
+        self.client = VoxCPMClient(VOXCPM_WORKER_URL)
 
     @staticmethod
     def _load_wav_compat(wav, target_sr, min_sr=16000):
@@ -1094,17 +1102,23 @@ def _get_tts():
     if tts_engine is None:
         with _tts_init_lock:
             if tts_engine is None:
-                try:
-                    if TTS_BACKEND == "edge":
-                        tts_engine = EdgeTTSEngine()
-                    elif TTS_BACKEND == "cosyvoice":
-                        tts_engine = CosyVoiceTTSEngine()
-                    else:
-                        tts_engine = TTSEngine()
-                except Exception as e:
-                    logger.warning(f"TTS 引擎未加载（阶段 2 功能，不影响文字聊天）: {e}")
+                tts_engine = VoxCPMClient(VOXCPM_WORKER_URL)
     return tts_engine
 
+
+'''
+
+tts_engine = None
+_tts_init_lock = threading.Lock()
+
+def _get_tts() -> VoxCPMClient:
+    """Return the single configured VoxCPM worker client."""
+    global tts_engine
+    if tts_engine is None:
+        with _tts_init_lock:
+            if tts_engine is None:
+                tts_engine = VoxCPMClient(VOXCPM_WORKER_URL)
+    return tts_engine
 
 # =============================================================================
 # 音频上传处理（音色克隆 US-03）
@@ -1177,16 +1191,18 @@ def handle_audio_upload(uploaded_file) -> dict:
             os.remove(save_path)
             return error_response("TTS_ERR_002", err_msg)
 
-        # 更新 TTS 参考音频
-        if _get_tts() is not None:
-            _get_tts().update_ref_audio(save_path)
-
         logger.info(f"参考音频已保存: {save_path}")
+        try:
+            worker_reply = _get_tts().update_ref_audio(save_path)
+        except Exception as exc:
+            logger.error("VoxCPM 参考音频更新失败: %s", exc)
+            return error_response("TTS_WORKER_001", "参考音频已保存，但 VoxCPM 音色更新失败，请检查 Worker")
         return {
             "ok": True,
             "message": "参考音频上传成功，音色克隆已更新",
             # SEC-17: 不暴露完整文件路径
             "file_id": safe_name,
+            "reference_id": worker_reply.get("reference_id"),
         }
 
     except Exception as e:
@@ -1298,14 +1314,7 @@ class ConversationPipeline:
         if not TTS_BACKCHANNEL_ENABLED:
             return None
         engine = _get_tts()
-        if engine is None or not hasattr(engine, "get_backchannel"):
-            return None
-        cached = engine.get_backchannel()
-        if cached is None:
-            return None
-        audio, sr = cached
-        self._audio_segments.append((audio, sr))
-        return {"type": "audio", "data": (sr, (audio * 32767).astype(np.int16))}
+        return None
 
     def process_voice(self, audio_data: np.ndarray, sample_rate: int = 16000) -> Generator[dict, None, None]:
         """
@@ -1346,39 +1355,38 @@ class ConversationPipeline:
 
         cancel = state_machine.cancel_event
 
-        cosyvoice = _get_tts() if TTS_BACKEND == "cosyvoice" else None
-        if cosyvoice is not None and hasattr(cosyvoice, "stream_text_synthesize"):
-            full_reply = yield from self._stream_cosyvoice_reply(session_id, cancel)
-        else:
-            full_reply = ""
-            tts_pending = ""
-            try:
-                for token in llm_client.stream_chat(self.history, cancel):
+        # VoxCPM is the only active TTS route. Keep LLM units short enough for
+        # the worker's streaming endpoint to return audio while more text is
+        # still arriving.
+        full_reply = ""
+        tts_pending = ""
+        try:
+            for token in llm_client.stream_chat(self.history, cancel):
+                if cancel.is_set():
+                    break
+                full_reply += token
+                yield {"type": "reply_token", "text": token}
+                tts_pending += token
+                tts_units, tts_pending = pop_tts_units(tts_pending)
+                for sentence in tts_units:
                     if cancel.is_set():
                         break
-                    full_reply += token
-                    yield {"type": "reply_token", "text": token}
-                    tts_pending += token
-                    tts_units, tts_pending = pop_tts_units(tts_pending)
-                    for sentence in tts_units:
-                        if cancel.is_set():
-                            break
-                        yield from self._synthesize_and_dispatch(
-                            sentence, session_id, cancel
-                        )
+                    yield from self._synthesize_and_dispatch(
+                        sentence, session_id, cancel
+                    )
 
-                if tts_pending.strip() and not cancel.is_set():
-                    speech_units, tts_pending = pop_tts_units(tts_pending, final=True)
-                    for sentence in speech_units:
-                        if cancel.is_set():
-                            break
-                        yield from self._synthesize_and_dispatch(
-                            sentence, session_id, cancel
-                        )
-            except PipelineError as e:
-                state_machine.transition(AvatarState.IDLE)
-                yield {"type": "error", "error": e.to_dict()["error"]}
-                return
+            if tts_pending.strip() and not cancel.is_set():
+                speech_units, tts_pending = pop_tts_units(tts_pending, final=True)
+                for sentence in speech_units:
+                    if cancel.is_set():
+                        break
+                    yield from self._synthesize_and_dispatch(
+                        sentence, session_id, cancel
+                    )
+        except PipelineError as e:
+            state_machine.transition(AvatarState.IDLE)
+            yield {"type": "error", "error": e.to_dict()["error"]}
+            return
 
         # ---- 保存到历史 ----
         if not cancel.is_set():
@@ -1402,53 +1410,32 @@ class ConversationPipeline:
         self.history.append({"role": "user", "content": text})
         yield {"type": "transcription", "text": text}
 
-        backchannel = self._backchannel_event()
-        if backchannel:
-            yield backchannel
-
         cancel = state_machine.cancel_event
-
-        cosyvoice = _get_tts() if TTS_BACKEND == "cosyvoice" else None
-        if cosyvoice is not None and hasattr(cosyvoice, "stream_text_synthesize"):
-            full_reply = yield from self._stream_cosyvoice_reply(session_id, cancel)
-        else:
-            full_reply = ""
-            tts_pending = ""
-            try:
-                for token in llm_client.stream_chat(self.history, cancel):
+        full_reply = ""
+        tts_pending = ""
+        try:
+            for token in llm_client.stream_chat(self.history, cancel):
+                if cancel.is_set():
+                    break
+                full_reply += token
+                yield {"type": "reply_token", "text": token}
+                tts_pending += token
+                tts_units, tts_pending = pop_tts_units(tts_pending)
+                for sentence in tts_units:
                     if cancel.is_set():
                         break
-                    full_reply += token
-                    yield {"type": "reply_token", "text": token}
+                    yield from self._synthesize_and_dispatch(sentence, session_id, cancel)
+        except PipelineError as e:
+            state_machine.transition(AvatarState.IDLE)
+            yield {"type": "error", "error": e.to_dict()["error"]}
+            return
 
-                    if TTS_BACKEND != "edge":
-                        tts_pending += token
-                        tts_units, tts_pending = pop_tts_units(tts_pending)
-                        for sentence in tts_units:
-                            if cancel.is_set():
-                                break
-                            yield from self._synthesize_and_dispatch(
-                                sentence, session_id, cancel
-                            )
-
-            except PipelineError as e:
-                state_machine.transition(AvatarState.IDLE)
-                yield {"type": "error", "error": e.to_dict()["error"]}
-                return
-
-            if full_reply.strip() and not cancel.is_set():
-                if TTS_BACKEND == "edge":
-                    speech_units = [full_reply.strip()]
-                else:
-                    speech_units, tts_pending = pop_tts_units(
-                        tts_pending, final=True
-                    )
-                for sentence in speech_units:
-                    if cancel.is_set():
-                        break
-                    yield from self._synthesize_and_dispatch(
-                        sentence, session_id, cancel
-                    )
+        if full_reply.strip() and not cancel.is_set():
+            speech_units, _ = pop_tts_units(tts_pending, final=True)
+            for sentence in speech_units:
+                if cancel.is_set():
+                    break
+                yield from self._synthesize_and_dispatch(sentence, session_id, cancel)
 
         if not cancel.is_set():
             self.history.append({"role": "assistant", "content": full_reply})
@@ -2239,7 +2226,7 @@ def create_ui():
             audio_segments = []
             audio_sr = 24000
             progressive_audio_count = 0
-            progressive_qwen = TTS_BACKEND != "edge"
+            progressive_voxcpm = True
 
             def audio_skip():
                 """Keep the current browser audio while text/status streams update."""
@@ -2320,7 +2307,7 @@ def create_ui():
                     elif event["type"] == "audio":
                         sr, audio_data = event["data"]
                         if audio_data is not None and len(audio_data) > 0:
-                            if progressive_qwen:
+                            if progressive_voxcpm:
                                 progressive_audio_count += 1
                                 duration = len(audio_data) / max(sr, 1)
                                 logger.info(
@@ -2559,8 +2546,8 @@ if __name__ == "__main__":
     logger.info("local-ai-companion-v2 speech-to-speech 管线启动")
     logger.info(f"配置文件: {CONFIG_PATH}")
     logger.info(f"LLM 地址: {LLM_BASE_URL}")
-    logger.info(f"TTS 模型: {TTS_MODEL_PATH}")
-    logger.info(f"TTS 后端: {TTS_BACKEND}")
+    logger.info(f"TTS 模型: {VOXCPM_MODEL_ID} ({VOXCPM_PROFILE})")
+    logger.info(f"TTS 后端: VoxCPM Worker ({VOXCPM_WORKER_URL})")
     logger.info(f"上传目录: {UPLOAD_DIR}")
     logger.info("=" * 60)
 

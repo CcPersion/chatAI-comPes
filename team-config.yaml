@@ -2,12 +2,12 @@
 mode: standalone
 project:
   name: "local-ai-companion-v2"
-  description: "基于 wav2lip256 + llama.cpp + faster-whisper + Qwen3-TTS 的本地 AI 赛博女友，WSL2 运行，WebRTC 数字人实时交互"
+  description: "基于 wav2lip256 + llama.cpp + faster-whisper + VoxCPM 的本地 AI 赛博女友，WSL2 运行，WebRTC 数字人实时交互"
   tech_stack:
     - python          # speech-to-speech pipeline
     - llama.cpp       # 大模型推理 (Qwen3-14B/8B Q4_K_M)
     - faster-whisper  # 语音识别
-    - Qwen3-TTS       # 语音合成 + 声音克隆
+    - VoxCPM          # 独立 Worker 流式语音合成 + 声音克隆
     - wav2lip256       # 口型同步
     - LiveTalking      # WebRTC 数字人渲染
     - Gradio           # 前端 UI（可后续升级为 React）

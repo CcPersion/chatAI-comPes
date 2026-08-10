@@ -1,0 +1,22 @@
+# Dedicated VoxCPM worker environment. Keep separate from the main Gradio 4
+# environment because upstream VoxCPM currently requires Gradio 6.x and
+# Python 3.10-3.12.
+gradio>=6,<7
+voxcpm
+torch>=2.5.0
+torchaudio>=2.5.0
+torchcodec
+transformers>=4.36.2
+einops
+inflect
+addict
+wetext
+modelscope>=1.22.0
+huggingface-hub
+pydantic
+tqdm
+simplejson
+sortedcontainers
+soundfile
+librosa
+safetensors

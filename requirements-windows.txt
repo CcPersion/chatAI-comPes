@@ -1,6 +1,9 @@
 # Windows 精简依赖 — 文本聊天核心功能
 # 全量语音管线依赖见 outputs/backend/requirements.txt
 
+# The VoxCPM TTS worker is intentionally isolated from this Gradio 4 runtime.
+# Install it from outputs/backend/requirements-voxcpm.txt with scripts/install-voxcpm.sh.
+
 # UI
 gradio==4.44.1
 
