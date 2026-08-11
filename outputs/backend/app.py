@@ -442,26 +442,65 @@ class ASREngine:
             raise PipelineError("ASR_ERR_001", "未检测到有效语音，请再说一次")
 
         try:
-            # 确保音频为 float32
+            # 持续通话已经经过前置 VAD 切句，不能再让 Whisper 的二次
+            # VAD 因麦克风音量偏低把整句全部过滤掉。
             if audio_data.dtype != np.float32:
                 audio_data = audio_data.astype(np.float32)
-
-            segments, info = self.model.transcribe(
-                audio_data,
-                language=ASR_LANG,
-                beam_size=5,
-                vad_filter=True,
-                vad_parameters=dict(
-                    threshold=VAD_THRESH,
-                    min_silence_duration_ms=MIN_SILENCE_MS,
-                ),
+            audio_data = np.asarray(audio_data, dtype=np.float32)
+            if audio_data.ndim > 1:
+                audio_data = audio_data.mean(axis=1)
+            if sample_rate != 16000 and audio_data.size >= 2:
+                target_len = max(1, int(round(audio_data.size * 16000 / sample_rate)))
+                source_x = np.linspace(0.0, 1.0, num=audio_data.size, endpoint=False)
+                target_x = np.linspace(0.0, 1.0, num=target_len, endpoint=False)
+                audio_data = np.interp(target_x, source_x, audio_data).astype(np.float32)
+                sample_rate = 16000
+            rms = float(np.sqrt(np.mean(audio_data ** 2))) if audio_data.size else 0.0
+            peak = float(np.max(np.abs(audio_data))) if audio_data.size else 0.0
+            logger.info(
+                "ASR 输入音频: %.2fs, rms=%.6f, peak=%.6f",
+                len(audio_data) / max(sample_rate, 1),
+                rms,
+                peak,
             )
 
-            text_parts = []
-            for segment in segments:
-                text_parts.append(segment.text.strip())
+            def decode(source: np.ndarray, *, use_vad: bool) -> str:
+                kwargs = {
+                    "language": ASR_LANG,
+                    "beam_size": 5,
+                    "condition_on_previous_text": False,
+                }
+                if use_vad:
+                    kwargs.update(
+                        vad_filter=True,
+                        vad_parameters=dict(
+                            threshold=VAD_THRESH,
+                            min_silence_duration_ms=MIN_SILENCE_MS,
+                        ),
+                    )
+                else:
+                    kwargs["vad_filter"] = False
+                segments, _info = self.model.transcribe(source, **kwargs)
+                return "".join(
+                    segment.text.strip() for segment in segments
+                ).strip()
 
-            result = "".join(text_parts).strip()
+            try:
+                result = decode(audio_data, use_vad=True)
+            except Exception as exc:
+                logger.warning("ASR 二次 VAD 处理失败，转入容错重试: %s", exc)
+                result = ""
+            if not result and peak > 1e-5:
+                # 前置 WebRTC VAD 已经确认这是一段语音时，给低音量输入
+                # 一次无二次 VAD 的重试；增益封顶，避免底噪被无限放大。
+                gain = min(32.0, 0.18 / max(peak, 1e-5))
+                fallback_audio = np.clip(audio_data * max(1.0, gain), -1.0, 1.0)
+                logger.warning(
+                    "ASR 首次结果为空，使用低音量容错重试: gain=%.1fx",
+                    max(1.0, gain),
+                )
+                result = decode(fallback_audio, use_vad=False)
+
             if not result:
                 raise PipelineError("ASR_ERR_001", "未检测到有效语音，请再说一次")
 
