@@ -2104,6 +2104,227 @@ pipeline = ConversationPipeline()
 atexit.register(pipeline.shutdown)
 
 
+class ContinuousConversationSession:
+    """持续通话会话：接收麦克风块，VAD 自动切句并串行处理。"""
+
+    def __init__(self, conversation_pipeline: ConversationPipeline):
+        self.pipeline = conversation_pipeline
+        self._lock = threading.RLock()
+        self._active = False
+        self._stop_worker = threading.Event()
+        self._utterance_queue = queue.Queue()
+        self._event_queue = queue.Queue()
+        self._speech_buffer: List[np.ndarray] = []
+        self._pre_roll: deque = deque(maxlen=10)
+        self._speech_started = False
+        self._silence_ms = 0
+        self._noise_floor = 0.004
+        self._sample_rate = 16000
+        self._vad = VADDetector(sample_rate=self._sample_rate)
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name="continuous-conversation-worker",
+            daemon=True,
+        )
+        self._worker.start()
+
+    @property
+    def active(self) -> bool:
+        with self._lock:
+            return self._active
+
+    def start(self) -> None:
+        """开始持续通话，并打断可能正在播放的上一轮回复。"""
+        self.pipeline.stop()
+        with self._lock:
+            self._active = True
+            self._reset_utterance()
+        self._event_queue.put({
+            "type": "status", "state": "listening", "text": "通话中 · 请说话"
+        })
+        logger.info("持续通话已开启：等待麦克风音频")
+
+    def stop(self) -> None:
+        """结束通话并取消正在进行的识别、回复和播放。"""
+        with self._lock:
+            was_active = self._active
+            self._active = False
+            self._reset_utterance()
+        self.pipeline.stop()
+        if was_active:
+            self._event_queue.put({
+                "type": "status", "state": "idle", "text": "通话已结束"
+            })
+            logger.info("持续通话已结束")
+
+    def feed_audio(self, audio_data: Any) -> None:
+        """接收 Gradio Audio.stream 的一个增量音频块。"""
+        if not self.active or audio_data is None:
+            return
+        sample_rate, samples = self._normalise_audio(audio_data)
+        if samples.size == 0:
+            return
+        if sample_rate != self._sample_rate:
+            samples = self._resample(samples, sample_rate, self._sample_rate)
+            sample_rate = self._sample_rate
+
+        # 按 30ms 帧做 VAD，避免 WebRTC VAD 因收到整秒音频块而退回粗糙能量判断。
+        frame_samples = max(1, int(sample_rate * 30 / 1000))
+        for start in range(0, len(samples), frame_samples):
+            frame = samples[start:start + frame_samples]
+            if len(frame) < max(1, frame_samples // 2):
+                continue
+            self._feed_frame(frame, sample_rate)
+
+    def drain_events(self) -> List[dict]:
+        """取出后台管线事件，由 Audio.stream 回调刷新到页面。"""
+        events = []
+        while True:
+            try:
+                events.append(self._event_queue.get_nowait())
+            except queue.Empty:
+                return events
+
+    def shutdown(self) -> None:
+        self.stop()
+        self._stop_worker.set()
+        self._utterance_queue.put(None)
+
+    def _feed_frame(self, frame: np.ndarray, sample_rate: int) -> None:
+        is_silence, energy = self._vad.detect_silence_boundary(frame)
+        if not self._vad.use_webrtc:
+            # 现有 voice.yaml 的 VAD_THRESH 是 0.1~0.9 的灵敏度配置，不能
+            # 直接拿来和归一化 PCM 的 RMS（通常 0.01~0.1）比较。
+            # 使用启动阶段噪声底自适应，避免“麦克风有数据但永远不触发”。
+            adaptive_threshold = max(0.006, self._noise_floor * 2.2)
+            is_silence = energy < adaptive_threshold
+            if is_silence:
+                self._noise_floor = self._noise_floor * 0.95 + energy * 0.05
+        frame_ms = max(1, int(len(frame) * 1000 / sample_rate))
+
+        with self._lock:
+            if not self._active:
+                return
+            if not self._speech_started:
+                self._pre_roll.append(frame.copy())
+                if is_silence:
+                    return
+                self._speech_started = True
+                self._silence_ms = 0
+                self._speech_buffer = list(self._pre_roll)
+                self._pre_roll.clear()
+                current_state = state_machine.state
+                if current_state in (AvatarState.THINKING, AvatarState.SPEAKING):
+                    # 用户开始说话即视为插话，不等句子结束才打断。
+                    self.pipeline.stop()
+                self._event_queue.put({
+                    "type": "status", "state": "listening", "text": "正在听..."
+                })
+                logger.info("持续通话检测到用户说话，开始收集句子")
+                return
+
+            self._speech_buffer.append(frame.copy())
+            if is_silence:
+                self._silence_ms += frame_ms
+            else:
+                self._silence_ms = 0
+
+            buffered_samples = sum(len(item) for item in self._speech_buffer)
+            too_long = buffered_samples >= self._sample_rate * max(1, MAX_AUDIO_SEC)
+            if self._silence_ms >= max(300, MIN_SILENCE_MS) or too_long:
+                utterance = np.concatenate(self._speech_buffer).astype(np.float32)
+                trim = int(self._sample_rate * self._silence_ms / 1000)
+                if trim > 0 and len(utterance) - trim >= int(self._sample_rate * 0.3):
+                    utterance = utterance[:-trim]
+                self._reset_utterance()
+                self._utterance_queue.put((utterance, self._sample_rate))
+                self._event_queue.put({
+                    "type": "status", "state": "thinking", "text": "正在识别..."
+                })
+                logger.info(
+                    "持续通话句子结束: %.2fs, energy=%.4f%s",
+                    len(utterance) / self._sample_rate,
+                    energy,
+                    "（达到单句上限）" if too_long else "",
+                )
+
+    def _worker_loop(self) -> None:
+        while not self._stop_worker.is_set():
+            item = self._utterance_queue.get()
+            if item is None:
+                return
+            audio, sample_rate = item
+            if not self.active:
+                continue
+            try:
+                for event in self.pipeline.process_voice(audio, sample_rate):
+                    self._event_queue.put(event)
+            except Exception:
+                logger.error("持续通话句子处理异常: %s", traceback.format_exc())
+                self._event_queue.put({
+                    "type": "error",
+                    "error": {
+                        "code": "VOICE_SESSION_ERR",
+                        "message": "语音处理失败，请继续说话重试",
+                    },
+                })
+            finally:
+                if self.active:
+                    self._event_queue.put({
+                        "type": "status",
+                        "state": "listening",
+                        "text": "通话中 · 请说话",
+                    })
+
+    def _reset_utterance(self) -> None:
+        self._speech_buffer = []
+        self._pre_roll.clear()
+        self._speech_started = False
+        self._silence_ms = 0
+
+    @staticmethod
+    def _normalise_audio(audio_data: Any) -> Tuple[int, np.ndarray]:
+        if isinstance(audio_data, dict):
+            path = audio_data.get("path")
+            if not path:
+                return 16000, np.array([], dtype=np.float32)
+            try:
+                import soundfile as sf
+                samples, sample_rate = sf.read(path, dtype="float32")
+                return ContinuousConversationSession._normalise_audio(
+                    (sample_rate, samples)
+                )
+            except Exception:
+                logger.warning("持续通话音频块读取失败: %s", traceback.format_exc())
+                return 16000, np.array([], dtype=np.float32)
+        if isinstance(audio_data, tuple):
+            sample_rate, samples = audio_data
+        else:
+            sample_rate, samples = 16000, audio_data
+        if samples is None:
+            return 16000, np.array([], dtype=np.float32)
+        samples = np.asarray(samples)
+        if samples.ndim > 1:
+            samples = samples.mean(axis=1) if samples.shape[1] else samples.flatten()
+        if samples.dtype == np.int16:
+            samples = samples.astype(np.float32) / 32768.0
+        else:
+            samples = samples.astype(np.float32)
+            peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+            if peak > 1.5:
+                samples = samples / 32768.0
+        return int(sample_rate or 16000), np.clip(samples, -1.0, 1.0)
+
+    @staticmethod
+    def _resample(samples: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
+        if source_rate <= 0 or source_rate == target_rate or len(samples) < 2:
+            return samples
+        target_len = max(1, int(round(len(samples) * target_rate / source_rate)))
+        source_x = np.linspace(0.0, 1.0, num=len(samples), endpoint=False)
+        target_x = np.linspace(0.0, 1.0, num=target_len, endpoint=False)
+        return np.interp(target_x, source_x, samples).astype(np.float32)
+
+
 # =============================================================================
 # Gradio UI 构建 (#7 架构设计)
 # =============================================================================
@@ -2419,6 +2640,11 @@ def create_ui():
     .voice-ball-btn:focus-visible {
         outline: 2px solid #7C3AED !important;
         outline-offset: 6px !important;
+    }
+
+    /* 保留 Gradio Audio.stream 的前端初始化，但不让录音控件占用布局。 */
+    #voice-mic-recorder {
+        display: none !important;
     }
 
     /* ── Stop button (compact icon) ────────────────────────────────────────── */
@@ -3025,7 +3251,7 @@ def create_ui():
         window.setInterval(() => {
             const area = document.querySelector('#utility-drawer .utility-log-scroll');
             if (!area) return;
-            const length = String(area.value.length);
+            const length = String(area.textContent || '').length;
             if (area.dataset.lastLogLength !== length) {
                 area.dataset.lastLogLength = length;
                 window.requestAnimationFrame(() => { area.scrollTop = area.scrollHeight; });
@@ -3353,7 +3579,7 @@ def create_ui():
 
         # ---- 隐藏组件 ----
         audio_input = gr.Audio(
-            sources=["microphone"], type="numpy", visible=False,
+            sources=["microphone"], type="numpy", streaming=True, visible=True,
             elem_id="voice-mic-recorder",
         )
         upload_status = gr.Textbox(visible=False)
@@ -3362,6 +3588,9 @@ def create_ui():
         # 事件处理
         # =====================================================================
         is_recording = gr.State(False)
+        phone_active = gr.State(False)
+        phone_session = ContinuousConversationSession(pipeline)
+        atexit.register(phone_session.shutdown)
         ui_chat_history = []
 
         def handle_text_input(text):
@@ -3561,9 +3790,78 @@ def create_ui():
                 chat_history.append(make_message("assistant", "处理失败，请重试"))
             yield chat_history, status, ""
 
+        def toggle_phone_mode(active):
+            if active:
+                phone_session.stop()
+                return False, "通话已结束"
+            phone_session.start()
+            return True, "通话中 · 请说话"
+
+        def poll_phone_events(active):
+            """把后台通话线程产生的事件低频合并到 Gradio 页面。"""
+            nonlocal ui_chat_history
+            if not active:
+                return gr.skip(), gr.skip(), gr.skip()
+
+            events = phone_session.drain_events()
+            if not events:
+                return gr.skip(), gr.skip(), gr.skip()
+
+            status = "通话中 · 请说话"
+
+            def make_message(role, content):
+                if hasattr(gr, "ChatMessage"):
+                    return gr.ChatMessage(role=role, content=content)
+                return {"role": role, "content": content}
+
+            def set_message_content(message, content):
+                if isinstance(message, dict):
+                    message["content"] = content
+                else:
+                    message.content = content
+
+            for event in events:
+                event_type = event.get("type")
+                if event_type == "transcription":
+                    ui_chat_history.append(make_message("user", event.get("text", "")))
+                    ui_chat_history.append(make_message("assistant", ""))
+                elif event_type == "reply_token":
+                    last_is_assistant = bool(ui_chat_history) and (
+                        (isinstance(ui_chat_history[-1], dict) and ui_chat_history[-1].get("role") == "assistant")
+                        or getattr(ui_chat_history[-1], "role", None) == "assistant"
+                    )
+                    if not last_is_assistant:
+                        ui_chat_history.append(make_message("assistant", ""))
+                    current = ui_chat_history[-1]
+                    old_content = current.get("content", "") if isinstance(current, dict) else getattr(current, "content", "")
+                    set_message_content(current, old_content + event.get("text", ""))
+                elif event_type == "status":
+                    status = event.get("text", status)
+                    if event.get("state") == "idle" and phone_session.active:
+                        status = "通话中 · 请说话"
+                elif event_type == "audio":
+                    status = "播放中 · 你可以随时插话"
+                elif event_type == "error":
+                    error = event.get("error", {})
+                    ui_chat_history.append(make_message(
+                        "assistant", f"错误：{error.get('message', '语音处理失败')}"
+                    ))
+                    status = "通话中 · 请继续说话"
+
+            return ui_chat_history, status, gr.skip()
+
+        def handle_phone_audio_chunk(audio_data):
+            """Audio.stream 的单一入口：入队音频后立即刷新通话 UI。"""
+            active = phone_session.active
+            if not active:
+                return gr.skip(), gr.skip(), gr.skip()
+            phone_session.feed_audio(audio_data)
+            return poll_phone_events(active)
+
         def handle_stop():
+            phone_session.stop()
             pipeline.stop()
-            return gr.skip(), "已停止"
+            return gr.skip(), "已停止", False
 
         def update_connection_status():
             return format_status_summary(get_service_status())
@@ -3692,14 +3990,14 @@ def create_ui():
             }""",
         )
         stop_btn.click(
-            fn=handle_stop, inputs=[], outputs=[chatbot, status_text],
+            fn=handle_stop, inputs=[], outputs=[chatbot, status_text, phone_active],
         )
-        # 语音球: 第一次点击开始麦克风录制，第二次点击停止并提交。
+        # 语音球：开启后持续保持麦克风连接，由服务端 VAD 自动切句。
         # 只操作 Gradio 的录音按钮，绝不能点击 file input，否则会打开文件夹。
         voice_btn.click(
-            fn=None,
-            inputs=[],
-            outputs=[],
+            fn=toggle_phone_mode,
+            inputs=[phone_active],
+            outputs=[phone_active, status_text],
             js="""() => {
                 const recorder = document.getElementById('voice-mic-recorder');
                 if (!recorder) {
@@ -3731,16 +4029,29 @@ def create_ui():
                 control.click();
                 const voiceBall = document.querySelector('.voice-ball-btn');
                 if (voiceBall) {
-                    voiceBall.textContent = stopControl ? '语音\\n对话' : '停止\\n并发送';
+                    voiceBall.textContent = stopControl ? '语音\\n通话' : '结束\\n通话';
                     voiceBall.classList.toggle('is-recording', !stopControl);
+                    voiceBall.setAttribute('aria-label', stopControl ? '开始语音通话' : '结束语音通话');
                 }
             }""",
         )
-        audio_input.stop_recording(
-            fn=handle_audio_input,
-            inputs=[audio_input],
-            outputs=[chatbot, status_text, text_input],
-        )
+        audio_stream_kwargs = {
+            "fn": handle_phone_audio_chunk,
+            # Gradio 4 的 stream 事件只会把流式 Audio 作为输入传回；State
+            # 不会随每个音频块一起提交，因此从 phone_session.active 读取。
+            "inputs": [audio_input],
+            "outputs": [chatbot, status_text, text_input],
+            "queue": False,
+            "show_progress": "hidden",
+            "concurrency_limit": None,
+        }
+        # Gradio 6 exposes ``stream_every`` for backend stream throttling.
+        # Gradio 4 的 ``every`` 会把 Audio.stream 改造成 Timer.tick，导致
+        # 音频块不再作为输入传入，因此不能把它用于这里的持续麦克风链路。
+        stream_signature = inspect.signature(audio_input.stream).parameters
+        if "stream_every" in stream_signature:
+            audio_stream_kwargs["stream_every"] = 0.25
+        audio_input.stream(**audio_stream_kwargs)
         # 页面加载
         demo.load(
             fn=update_status_display,
