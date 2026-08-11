@@ -32,6 +32,7 @@ ASR_MODEL: "/root/setup/models/faster-whisper-large-v3"
 ASR_LANG: "zh"
 ASR_COMPUTE_TYPE: "int8_float16"
 ASR_BEAM_SIZE: 1
+ASR_WARMUP_ENABLED: true
 # 转写目标语言。中文使用 "zh"。
 # 也支持 "en" 等 faster-whisper 支持的语言代码。
 

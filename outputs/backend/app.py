@@ -126,6 +126,7 @@ ASR_MODEL = str(config.get("ASR_MODEL", "large-v3"))
 ASR_LANG = str(config.get("ASR_LANG", "zh"))
 ASR_COMPUTE_TYPE = str(config.get("ASR_COMPUTE_TYPE", "int8_float16"))
 ASR_BEAM_SIZE = int(config.get("ASR_BEAM_SIZE", 1))
+ASR_WARMUP_ENABLED = bool(config.get("ASR_WARMUP_ENABLED", True))
 LLM_BASE_URL = str(config.get("LLM_BASE_URL", "http://localhost:8090"))
 LLM_MODEL = str(config.get("LLM_MODEL", "qwen3-8b"))
 LLM_MAX_TOKENS = int(config.get("LLM_MAX_TOKENS", 1024))
@@ -4129,6 +4130,10 @@ if __name__ == "__main__":
         if hasattr(engine, "prepare_backchannel"):
             engine.prepare_backchannel()
         llm_client.warmup()
+        if ASR_WARMUP_ENABLED:
+            logger.info("ASR 后台预热开始")
+            _get_asr()
+            logger.info("ASR 后台预热完成")
 
     threading.Thread(
         target=warm_local_models,
