@@ -23,6 +23,9 @@ VENV_DIR="${SETUP_DIR}/venv"
 LOG_DIR="${SETUP_DIR}/logs"
 VOICE_LOG="${LOG_DIR}/voice.log"
 CONFIG_FILE="${SETUP_DIR}/voice.yaml"
+ASR_CUDNN8_LIB_DIR="${ASR_CUDNN8_LIB_DIR:-${SETUP_DIR}/asr-cudnn8/nvidia/cudnn/lib}"
+ASR_CTRANSLATE2_LIB_DIR="${VENV_DIR}/lib/python3.12/site-packages/ctranslate2.libs"
+ASR_CUBLAS_LIB_DIR="${VENV_DIR}/lib/python3.12/site-packages/nvidia/cublas/lib"
 
 # ---- 目录准备 ----
 mkdir -p "${LOG_DIR}"
@@ -36,6 +39,11 @@ fi
 
 if [ ! -f "${VENV_DIR}/bin/activate" ]; then
     log_error "Python 虚拟环境不存在，请先运行 install-voice.sh"
+    exit 1
+fi
+
+if [ ! -f "${ASR_CUDNN8_LIB_DIR}/libcudnn_ops_infer.so.8" ]; then
+    log_error "ASR cuDNN 8 库缺失: ${ASR_CUDNN8_LIB_DIR}/libcudnn_ops_infer.so.8"
     exit 1
 fi
 
@@ -73,7 +81,9 @@ log_info "日志: ${VOICE_LOG}"
 # 启动 Gradio（后台运行，日志写入文件）
 # Gradio 默认监听 0.0.0.0:7860，通过 WSL2 localhostForwarding 对 Windows 可见。
 # 若需仅监听 127.0.0.1，可在 app.py 中设置 server_name="127.0.0.1"。
-nohup python "${APP_PY}" > "${VOICE_LOG}" 2>&1 &
+ASR_LD_LIBRARY_PATH="${ASR_CUDNN8_LIB_DIR}:${ASR_CTRANSLATE2_LIB_DIR}:${ASR_CUBLAS_LIB_DIR}"
+nohup env LD_LIBRARY_PATH="${ASR_LD_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+    python "${APP_PY}" > "${VOICE_LOG}" 2>&1 &
 APP_PID=$!
 echo "${APP_PID}" > "${SETUP_DIR}/voice.pid"
 log_info "Gradio PID: ${APP_PID}"

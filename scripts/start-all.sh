@@ -9,6 +9,18 @@ set -e
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MAIN_PYTHON="${MAIN_PYTHON:-$ROOT_DIR/venv/bin/python}"
 
+# faster-whisper/CTranslate2 4.4 的 CUDA 语音识别路径需要 cuDNN 8。
+# 与 VoxCPM 使用的 cuDNN 9 分离，避免两个虚拟环境互相覆盖动态库。
+ASR_CUDNN8_LIB_DIR="${ASR_CUDNN8_LIB_DIR:-$ROOT_DIR/asr-cudnn8/nvidia/cudnn/lib}"
+ASR_CTRANSLATE2_LIB_DIR="$ROOT_DIR/venv/lib/python3.12/site-packages/ctranslate2.libs"
+ASR_CUBLAS_LIB_DIR="$ROOT_DIR/venv/lib/python3.12/site-packages/nvidia/cublas/lib"
+if [[ ! -f "$ASR_CUDNN8_LIB_DIR/libcudnn_ops_infer.so.8" ]]; then
+  echo "ERROR: ASR cuDNN 8 library is missing: $ASR_CUDNN8_LIB_DIR/libcudnn_ops_infer.so.8" >&2
+  echo "       Install the dedicated ASR cuDNN 8 runtime before starting 7860." >&2
+  exit 4
+fi
+ASR_LD_LIBRARY_PATH="$ASR_CUDNN8_LIB_DIR:$ASR_CTRANSLATE2_LIB_DIR:$ASR_CUBLAS_LIB_DIR"
+
 # WSL2 地址会在重启后变化，更新 Windows 侧本地端口转发。
 WSL_IP="$(hostname -I | awk '{print $1}')"
 NETSH_EXE="/mnt/c/Windows/System32/netsh.exe"
@@ -79,7 +91,8 @@ echo "  PID=$!"
 
 echo "=== 启动 app.py (7860) ==="
 cd "$ROOT_DIR"
-nohup "$MAIN_PYTHON" "$ROOT_DIR/outputs/backend/app.py" > /tmp/app.log 2>&1 &
+nohup env LD_LIBRARY_PATH="$ASR_LD_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  "$MAIN_PYTHON" "$ROOT_DIR/outputs/backend/app.py" > /tmp/app.log 2>&1 &
 echo "  PID=$!"
 
 sleep 5
