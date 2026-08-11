@@ -97,7 +97,7 @@ class GenerationRegistry:
 
 
 class VoxCPMRuntime:
-    def __init__(self, model_path: str, model_id: str, profile: str, ref_wav: str = "", ref_text: str = "", configured_sample_rate: int = 0, reference_root: str = "") -> None:
+    def __init__(self, model_path: str, model_id: str, profile: str, ref_wav: str = "", ref_text: str = "", configured_sample_rate: int = 0, reference_root: str = "", inference_timesteps: int = 4) -> None:
         self.model_path = str(Path(model_path).expanduser().resolve())
         self.model_id = model_id
         self.profile = profile
@@ -105,6 +105,7 @@ class VoxCPMRuntime:
         self.reference_root = Path(reference_root).expanduser().resolve() if reference_root else None
         self.ref_text = ref_text
         self.configured_sample_rate = int(configured_sample_rate or EXPECTED_SAMPLE_RATES[model_id])
+        self.inference_timesteps = max(1, int(inference_timesteps))
         self.model = None
         self.actual_sample_rate: Optional[int] = None
         self.error: Optional[str] = None
@@ -224,7 +225,10 @@ class VoxCPMRuntime:
         if not self.ready:
             yield {"type": "error", "request_id": request_id, "generation_id": generation_id, "error": {"code": "TTS_MODEL_001", "message": self.error or "model not ready", "retryable": True}}
             return
-        kwargs: Dict[str, Any] = {"text": text}
+        kwargs: Dict[str, Any] = {
+            "text": text,
+            "inference_timesteps": self.inference_timesteps,
+        }
         if self.ref_wav:
             if not os.path.isfile(self.ref_wav):
                 yield {"type": "error", "request_id": request_id, "generation_id": generation_id, "error": {"code": "TTS_REF_001", "message": "reference wav not found"}}
@@ -350,7 +354,16 @@ class Handler(BaseHTTPRequestHandler):
 def build_runtime(args: argparse.Namespace) -> VoxCPMRuntime:
     model_id = args.model_id
     profile_spec(args.profile, model_id)
-    return VoxCPMRuntime(args.model_path, model_id, args.profile, args.ref_wav, args.ref_text, args.sample_rate, args.reference_root)
+    return VoxCPMRuntime(
+        args.model_path,
+        model_id,
+        args.profile,
+        args.ref_wav,
+        args.ref_text,
+        args.sample_rate,
+        args.reference_root,
+        args.inference_timesteps,
+    )
 
 
 def main() -> None:
@@ -364,7 +377,10 @@ def main() -> None:
     parser.add_argument("--ref-text", default="")
     parser.add_argument("--reference-root", default="")
     parser.add_argument("--sample-rate", type=int, default=0)
+    parser.add_argument("--inference-timesteps", type=int, default=4)
     args = parser.parse_args()
+    if not 1 <= args.inference_timesteps <= 100:
+        parser.error("--inference-timesteps must be between 1 and 100")
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(message)s")
     runtime = build_runtime(args)
     runtime.load()

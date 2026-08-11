@@ -29,6 +29,8 @@ REF_TEXT="$(read_config VOXCPM_REF_TEXT)"
 REFERENCE_ROOT="$(read_config UPLOAD_DIR)"
 SAMPLE_RATE="$(read_config VOXCPM_SAMPLE_RATE)"
 WORKER_URL="$(read_config VOXCPM_WORKER_URL)"
+INFERENCE_TIMESTEPS="$(read_config VOXCPM_INFERENCE_TIMESTEPS)"
+INFERENCE_TIMESTEPS="${INFERENCE_TIMESTEPS:-4}"
 
 # Bash does not expand a tilde when it arrives through a variable.
 MODEL_PATH="${MODEL_PATH/#\~/$HOME}"
@@ -47,4 +49,4 @@ PORT="${BASH_REMATCH[1]}"
 [[ "$MODEL_ID" == "VoxCPM2" && "$SAMPLE_RATE" == 48000 || "$MODEL_ID" == "VoxCPM1.5" && "$SAMPLE_RATE" == 44100 ]] || { echo "ERROR: configured sample rate does not match model: $MODEL_ID / $SAMPLE_RATE" >&2; exit 2; }
 [[ -f "$ROOT_DIR/outputs/backend/voxcpm_worker.py" ]] || { echo "ERROR: worker source missing" >&2; exit 2; }
 
-exec "$PYTHON_BIN" "$ROOT_DIR/outputs/backend/voxcpm_worker.py" --host 127.0.0.1 --port "$PORT" --model-path "$MODEL_PATH" --model-id "$MODEL_ID" --profile "$PROFILE" --ref-wav "$REF_WAV" --ref-text "$REF_TEXT" --reference-root "$REFERENCE_ROOT" --sample-rate "$SAMPLE_RATE"
+exec "$PYTHON_BIN" "$ROOT_DIR/outputs/backend/voxcpm_worker.py" --host 127.0.0.1 --port "$PORT" --model-path "$MODEL_PATH" --model-id "$MODEL_ID" --profile "$PROFILE" --ref-wav "$REF_WAV" --ref-text "$REF_TEXT" --reference-root "$REFERENCE_ROOT" --sample-rate "$SAMPLE_RATE" --inference-timesteps "$INFERENCE_TIMESTEPS"

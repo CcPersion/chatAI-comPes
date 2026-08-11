@@ -44,7 +44,30 @@ fuser -k 8011/tcp 2>/dev/null || true
 fuser -k 8020/tcp 2>/dev/null || true
 sleep 2
 
+echo "=== 启动 VoxCPM Worker (8020，先完成模型加载) ==="
+cd "$ROOT_DIR"
+nohup bash "$ROOT_DIR/scripts/start-voxcpm-worker.sh" > /tmp/voxcpm-worker.log 2>&1 &
+VOXCPM_PID=$!
+VOXCPM_READY=0
+for _ in $(seq 1 90); do
+  if curl -fsS http://127.0.0.1:8020/api/tts/health >/dev/null 2>&1; then
+    VOXCPM_READY=1
+    break
+  fi
+  if ! kill -0 "$VOXCPM_PID" 2>/dev/null; then
+    echo "ERROR: VoxCPM Worker exited during model loading; see /tmp/voxcpm-worker.log" >&2
+    exit 5
+  fi
+  sleep 2
+done
+if [[ "$VOXCPM_READY" != 1 ]]; then
+  echo "ERROR: VoxCPM Worker did not become ready within 180 seconds; see /tmp/voxcpm-worker.log" >&2
+  exit 5
+fi
+echo "  PID=$VOXCPM_PID (ready)"
+
 echo "=== 启动 LiveTalking (8010) ==="
+LIVETALKING_BATCH_SIZE="${LIVETALKING_BATCH_SIZE:-4}"
 LIVETALKING_LIFECYCLE_PATCH="$ROOT_DIR/scripts/livetalking-session-lifecycle.patch"
 LIVETALKING_RTC_MANAGER="$ROOT_DIR/LiveTalking/server/rtc_manager.py"
 
@@ -76,17 +99,12 @@ if [[ -f "$ROOT_DIR/scripts/livetalking-stream.patch" ]] && \
     < "$ROOT_DIR/scripts/livetalking-stream.patch"
 fi
 cd "$ROOT_DIR/LiveTalking"
-nohup "$MAIN_PYTHON" app.py --transport webrtc --model wav2lip --avatar_id wav2lip256_avatar_256 --listenport 8010 > /tmp/livetalking.log 2>&1 &
+nohup "$MAIN_PYTHON" app.py --transport webrtc --model wav2lip --avatar_id wav2lip256_avatar_256 --batch_size "$LIVETALKING_BATCH_SIZE" --listenport 8010 > /tmp/livetalking.log 2>&1 &
 echo "  PID=$!"
 
 echo "=== 启动 avatar-sync (8011) ==="
 cd "$ROOT_DIR"
 setsid -f node "$ROOT_DIR/scripts/avatar-sync.js" > /tmp/avatar-sync.log 2>&1 < /dev/null &
-echo "  PID=$!"
-
-echo "=== 启动 VoxCPM Worker (8020) ==="
-cd "$ROOT_DIR"
-nohup bash "$ROOT_DIR/scripts/start-voxcpm-worker.sh" > /tmp/voxcpm-worker.log 2>&1 &
 echo "  PID=$!"
 
 echo "=== 启动 app.py (7860) ==="

@@ -30,6 +30,8 @@ ASR_MODEL: "/root/setup/models/faster-whisper-large-v3"
 # 直接使用已下载的本地模型目录；离线模式下不能只写 large-v3 别名。
 
 ASR_LANG: "zh"
+ASR_COMPUTE_TYPE: "int8_float16"
+ASR_BEAM_SIZE: 1
 # 转写目标语言。中文使用 "zh"。
 # 也支持 "en" 等 faster-whisper 支持的语言代码。
 
@@ -68,6 +70,7 @@ VOXCPM_SAMPLE_RATE: 48000
 VOXCPM_WORKER_URL: "http://127.0.0.1:8020"
 VOXCPM_LOCAL_FILES_ONLY: true
 VOXCPM_STYLE_PROMPT: "语速自然"
+VOXCPM_INFERENCE_TIMESTEPS: 4
 ROLE_STYLE: "温柔陪伴"
 ROLE_CUSTOM_INSTRUCTION: ""
 # VoxCPM2 原生括号指令，只影响合成语音，不改变聊天界面文本。

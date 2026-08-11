@@ -124,6 +124,8 @@ MIN_SILENCE_MS = int(config.get("MIN_SILENCE_MS", 700))
 MAX_AUDIO_SEC = int(config.get("MAX_AUDIO_SEC", 20))
 ASR_MODEL = str(config.get("ASR_MODEL", "large-v3"))
 ASR_LANG = str(config.get("ASR_LANG", "zh"))
+ASR_COMPUTE_TYPE = str(config.get("ASR_COMPUTE_TYPE", "int8_float16"))
+ASR_BEAM_SIZE = int(config.get("ASR_BEAM_SIZE", 1))
 LLM_BASE_URL = str(config.get("LLM_BASE_URL", "http://localhost:8090"))
 LLM_MODEL = str(config.get("LLM_MODEL", "qwen3-8b"))
 LLM_MAX_TOKENS = int(config.get("LLM_MAX_TOKENS", 1024))
@@ -404,7 +406,7 @@ class ASREngine:
             from faster_whisper import WhisperModel
             # 设备选择：CUDA 优先
             device = "cuda"
-            compute_type = "float16"
+            compute_type = ASR_COMPUTE_TYPE
             try:
                 import torch
                 if not torch.cuda.is_available():
@@ -463,11 +465,17 @@ class ASREngine:
                 rms,
                 peak,
             )
+            decode_audio = audio_data
+            input_gain = 1.0
+            if 1e-5 < peak < 0.08:
+                input_gain = min(32.0, 0.18 / peak)
+                decode_audio = np.clip(audio_data * input_gain, -1.0, 1.0)
+                logger.info("ASR 低音量预增益: gain=%.1fx", input_gain)
 
             def decode(source: np.ndarray, *, use_vad: bool) -> str:
                 kwargs = {
                     "language": ASR_LANG,
-                    "beam_size": 5,
+                    "beam_size": ASR_BEAM_SIZE,
                     "condition_on_previous_text": False,
                 }
                 if use_vad:
@@ -486,18 +494,17 @@ class ASREngine:
                 ).strip()
 
             try:
-                result = decode(audio_data, use_vad=True)
+                result = decode(decode_audio, use_vad=True)
             except Exception as exc:
                 logger.warning("ASR 二次 VAD 处理失败，转入容错重试: %s", exc)
                 result = ""
             if not result and peak > 1e-5:
                 # 前置 WebRTC VAD 已经确认这是一段语音时，给低音量输入
                 # 一次无二次 VAD 的重试；增益封顶，避免底噪被无限放大。
-                gain = min(32.0, 0.18 / max(peak, 1e-5))
-                fallback_audio = np.clip(audio_data * max(1.0, gain), -1.0, 1.0)
+                fallback_audio = decode_audio
                 logger.warning(
-                    "ASR 首次结果为空，使用低音量容错重试: gain=%.1fx",
-                    max(1.0, gain),
+                    "ASR 首次结果为空，关闭二次 VAD 重试: gain=%.1fx",
+                    input_gain,
                 )
                 result = decode(fallback_audio, use_vad=False)
 
